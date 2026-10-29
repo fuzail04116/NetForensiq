@@ -1,0 +1,60 @@
+# --- core ---
+asgiref==3.12.1
+Django==6.0.7
+djangorestframework==3.17.1
+djangorestframework_simplejwt==5.5.1
+django-cors-headers==4.9.0
+PyJWT==2.13.0
+python-dotenv==1.2.2
+sqlparse==0.5.5
+tzdata==2026.3
+
+# --- crypto (JWT signing, evidence hashing helpers) ---
+cffi==2.1.0
+cryptography==50.0.0
+pycparser==3.0
+
+# --- capture ---
+scapy==2.7.0
+
+# --- database ---
+# PostgreSQL driver. Optional: the project falls back to SQLite when
+# DB_ENGINE is unset, so a demo machine needs no PostgreSQL install.
+psycopg2-binary==2.9.12
+
+# --- analysis / detection ---
+numpy==2.3.4
+scikit-learn==1.7.2
+
+# --- APK examination engine ---
+# Runs as a separate process (see apk_engine/__init__.py): androguard and
+# apkInspector are Apache-2.0, scapy in the web process is GPL-2.0-only, and
+# the Apache Software Foundation states Apache-2.0 code "cannot be included in
+# GPLv2 projects".
+#
+# androguard itself is installed with --no-deps (see Dockerfile and
+# scripts/install_offline.sh) and the imports it actually needs are pinned
+# below. Its declared dependency set pulls IPython, jedi, pygments and
+# SQLAlchemy — interactive-shell tooling an evidence workstation has no use
+# for, and 110 MB of it.
+apkInspector==1.3.7
+asn1crypto==1.5.1
+colorama==0.4.6
+loguru==0.7.3
+lxml==6.1.3
+mutf8==1.1.0
+networkx==3.6.1
+
+# --- evidence certificate rendering ---
+reportlab==4.4.4
+
+# --- serving ---
+# WSGI server for the container image. The air-gapped single-workstation path
+# uses `manage.py runserver`, which is adequate for one analyst on loopback;
+# anything with more than one user in front of it needs a real worker model.
+gunicorn==23.0.0
+
+# --- testing ---
+pytest==8.4.2
+pytest-django==4.11.1
+pyzipper==0.3.6

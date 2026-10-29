@@ -1,0 +1,185 @@
+# ============================================================
+# NetForensiq — root .gitignore
+# Stack: Django + DRF (Python) | React + Vite (Node)
+# ============================================================
+
+# ──────────────────────────────────────────────────────────────
+# Python
+# ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+backend/.venv/
+backend/venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+dist/
+# The offline verifier is a build output that is also a published file: the page and
+# its digest are committed, and a test rebuilds the page to show they still match.
+!verifier/dist/
+build/
+sdist/
+wheels/
+*.whl
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ──────────────────────────────────────────────────────────────
+# Django
+# ──────────────────────────────────────────────────────────────
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+*.sqlite3
+*.sqlite3-journal
+backend/netforensiq.sqlite3
+backend/media/
+backend/staticfiles/
+backend/static_collected/
+
+# ──────────────────────────────────────────────────────────────
+# Environment / secrets  — NEVER commit credentials
+# ──────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+*.key
+.evidence.key
+backend/.evidence.key
+.signing.key
+backend/.signing.key
+backend/updates/
+
+# ──────────────────────────────────────────────────────────────
+# Node / JavaScript
+# ──────────────────────────────────────────────────────────────
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Vite build output
+frontend/dist/
+frontend/dist-ssr/
+*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ──────────────────────────────────────────────────────────────
+# Evidence & captures — NEVER commit case material
+# ──────────────────────────────────────────────────────────────
+*.pcap
+*.pcapng
+*.pcap.gz
+*.cap
+*.dmp
+evidence_store/
+backend/evidence_store/
+backend/synthetic_captures/
+captures/
+RealAttacksPCAP/
+
+# Generated forensic reports / certificates
+*.pdf
+
+# ──────────────────────────────────────────────────────────────
+# Testing & coverage
+# ──────────────────────────────────────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Playwright
+test-results/
+playwright-report/
+frontend/e2e/.auth/
+
+# ──────────────────────────────────────────────────────────────
+# IDE & editors
+# ──────────────────────────────────────────────────────────────
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# ──────────────────────────────────────────────────────────────
+# OS generated
+# ──────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ──────────────────────────────────────────────────────────────
+# Misc
+# ──────────────────────────────────────────────────────────────
+*.bak
+*.tmp
+*.temp
+*.cache
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+
+# Serena / code-intelligence local state
+.serena/
+backend/reference_captures/
+backend/.cache/
+
+# Local artefacts — regenerated, never reviewed in a diff
+# Playwright failure artefacts
+frontend/test-results/
+*.sqlite3-shm
+*.sqlite3-wal
+
+# ──────────────────────────────────────────────────────────────
+# Malware samples and sandbox output — NEVER commit these
+# ──────────────────────────────────────────────────────────────
+sandbox_results/
+*.apk
+*.apk.zip
+apk_corpus/
+malicious_mb/

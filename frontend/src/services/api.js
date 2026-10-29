@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+import axios from 'axios';
+
+import { API_BASE } from './apiBase';
+
+const api = axios.create({
+  baseURL: API_BASE,
+  headers: { 'Content-Type': 'application/json' },
+});
+
+// Attach access token to every outgoing request
+api.interceptors.request.use((config) => {
+  const token = sessionStorage.getItem('access_token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+
+  // A file upload is not JSON.
+  //
+  // The instance default above sets Content-Type: application/json on every
+  // request, which is right for all but one of them. On a FormData body it is
+  // actively wrong: the browser has to write
+  // `multipart/form-data; boundary=…`, and a header set by hand has no
+  // boundary token, so the server receives a body it cannot split. Django
+  // answered 415 "Unsupported media type" and the officer was told their
+  // capture was the wrong sort of file when it was the request that was
+  // malformed.
+  //
+  // Deleting the header rather than naming the type: only the browser knows
+  // the boundary it is about to generate.
+  if (typeof FormData !== 'undefined' && config.data instanceof FormData) {
+    delete config.headers['Content-Type'];
+  }
+  return config;
+});
+
+// Auto-refresh expired access tokens
+api.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const original = error.config;
+
+    // Never auto-redirect on auth endpoints — let the page show its own error
+    const isAuthEndpoint =
+      original?.url?.includes('/auth/login') ||
+      original?.url?.includes('/auth/register');
+
+    if (error.response?.status === 401 && !original._retry && !isAuthEndpoint) {
+      original._retry = true;
+      const refresh = sessionStorage.getItem('refresh_token');
+
+      if (refresh) {
+        try {
+          const res = await axios.post(`${API_BASE}/auth/login/refresh/`, { refresh });
+          sessionStorage.setItem('access_token', res.data.access);
+          if (res.data.refresh) {
+            sessionStorage.setItem('refresh_token', res.data.refresh);
+          }
+          original.headers.Authorization = `Bearer ${res.data.access}`;
+          return api(original);
+        } catch {
+          sessionStorage.clear();
+          window.location.href = '/login';
+        }
+      } else {
+        sessionStorage.clear();
+        window.location.href = '/login';
+      }
+    }
+
+    // Rate limiting is a real answer, not a failure to answer. Without this a
+    // 429 reached the page as a bare AxiosError and every caller rendered
+    // "Request failed" — or, where a caller forgot to catch, nothing at all.
+    if (error.response?.status === 429) {
+      const retry = error.response.headers?.['retry-after'];
+      error.friendlyMessage =
+        'Too many requests — this endpoint is rate limited.'
+        + (retry ? ` Try again in about ${Math.ceil(Number(retry) / 60)} minute(s).` : '');
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+/** The clearest thing we can say about a failed request. */
+export function describeError(error, fallback = 'Request failed.') {
+  return (
+    error?.friendlyMessage
+    ?? error?.response?.data?.detail
+    ?? (error?.message === 'Network Error'
+      ? 'Could not reach the API. Is the backend running?'
+      : null)
+    ?? fallback
+  );
+}
+
+export default api;

@@ -1,0 +1,421 @@
+import { test, expect, apiGet, apiPost, rows, API_BASE, shownCount } from './fixtures';
+
+/**
+ * Any rule the engine can emit. Findings are addressed by their accessible
+ * name, which begins with the rule id — see DetectionsPage's card header.
+ */
+const RULE_ID = /^(C2_BEACON|COVERT_CHANNEL|DNS_TUNNEL|RECON_|EXFIL_|ICMP_|HOST_)/;
+
+/**
+ * These tests assert the thing the code review flagged as the project's
+ * biggest credibility problem: that what appears on screen is real.
+ *
+ * A dashboard that renders is not the bar. A dashboard whose numbers match
+ * the API is.
+ */
+
+async function login(page) {
+  // Credentials are already in storage via global setup; this just lands the
+  // session on an authenticated page.
+  await page.goto('/dashboard');
+  await page.waitForURL(/dashboard/, { timeout: 20_000 });
+}
+
+/**
+ * How many rows the API holds for an endpoint.
+ *
+ * Skips must be decided from server state, never from `locator.count()`.
+ * `count()` returns 0 for "not rendered yet" as readily as for "does not
+ * exist", so a skip guarded that way turns a real UI regression into a green
+ * run — which is exactly what happened here before this helper existed.
+ */
+async function apiCount(page, path) {
+  return rows(await apiGet(page, path)).length;
+}
+
+test.describe('authentication', () => {
+  test('protected routes redirect anonymous users to login', async ({ anonymousPage }) => {
+    await anonymousPage.goto('/dashboard');
+    await expect(anonymousPage).toHaveURL(/login/);
+  });
+
+  test('a signed-in analyst reaches the dashboard', async ({ page }) => {
+    await login(page);
+    await expect(page).toHaveURL(/dashboard/);
+  });
+});
+
+test.describe('dashboard shows real data', () => {
+  test.beforeEach(async ({ page }) => login(page));
+
+  test('stat cards match the API summary exactly', async ({ page }) => {
+    // Read what the API actually returned for the selected session
+    const sessions = rows(await apiGet(page, 'sessions/'));
+    const summary = sessions.length
+      ? await apiGet(page, `sessions/${sessions[0].id}/summary/`)
+      : null;
+
+    test.skip(!summary, 'no capture sessions seeded');
+
+    // The flow count on screen must be the flow count in the database
+    const body = await page.locator('body').innerText();
+    expect(body).toContain(shownCount(summary.totals.flows));
+  });
+
+  test('no "Blocked" or "Archived" card — the tool cannot do either', async ({ page }) => {
+    const body = await page.locator('body').innerText();
+    expect(body).not.toMatch(/\bBlocked\b/);
+    expect(body).not.toMatch(/\bArchived\b/);
+  });
+
+  test('the old hardcoded placeholder figures are gone', async ({ page }) => {
+    const body = await page.locator('body').innerText();
+    for (const stale of ['627.16 M', '512.04 M', '14.82 M', '2.41 M', '88.30 M']) {
+      expect(body).not.toContain(stale);
+    }
+  });
+});
+
+test.describe('findings', () => {
+  test.beforeEach(async ({ page }) => login(page));
+
+  test('each finding explains itself and exposes its thresholds', async ({ page }) => {
+    await page.goto('/detections');
+    await expect(page.getByText(/Findings/i).first()).toBeVisible();
+
+    // Threshold provenance must be inspectable from the UI
+    await page.getByRole('button', { name: /detection thresholds/i }).click();
+    await expect(page.getByText(/beacon_min_connections/).first()).toBeVisible();
+  });
+
+  test('an analyst can triage a finding', async ({ page }) => {
+    await page.goto('/detections');
+
+    // Triage is a state change, so this test resets one finding to "new"
+    // first. Without that, a second run finds everything already reviewed
+    // and would fail for reasons unrelated to the behaviour under test.
+    const detections = rows(await apiGet(page, 'detections/'));
+    let pendingId = null;
+    if (detections.length) {
+      pendingId = detections[0].id;
+      await apiPost(page, `detections/${pendingId}/triage/`, { status: 'new', note: '' });
+    }
+
+    test.skip(!pendingId, 'no detections seeded');
+
+    await page.reload();
+    // Addressed by role and accessible name, not by matching text anywhere on
+    // the page: a rule id also appears inside collapsed rationale text, and a
+    // plain text locator resolved to a hidden element and waited for it
+    // forever.
+    const card = page.getByRole('button', { name: RULE_ID }).first();
+    await card.click();
+
+    const dismiss = page.getByRole('button', { name: /Dismiss/i }).first();
+    await expect(dismiss).toBeVisible();
+    await dismiss.click();
+
+    // The decision must be reflected back from the server, not just locally
+    await expect(page.getByText(/Reviewed/i).first()).toBeVisible();
+  });
+});
+
+test.describe('evidence', () => {
+  test.beforeEach(async ({ page }) => login(page));
+
+  test('exhibits show hashes and a custody verdict', async ({ page }) => {
+    await page.goto('/evidence');
+    await expect(page.getByText(/Evidence register/i)).toBeVisible();
+
+    test.skip(await apiCount(page, 'evidence/') === 0, 'no evidence seeded');
+
+    // Auto-waiting locator, so a slow render fails loudly instead of skipping
+    const chainButton = page.getByRole('button', { name: /chain of custody/i }).first();
+    await expect(chainButton).toBeVisible();
+    await chainButton.click();
+    await expect(
+      page.getByText(/Custody chain intact|Custody chain BROKEN/i).first(),
+    ).toBeVisible();
+  });
+});
+
+test.describe('provenance', () => {
+  test.beforeEach(async ({ page }) => login(page));
+
+  test('every exhibit states where its bytes came from', async ({ page }) => {
+    await page.goto('/evidence');
+    await expect(page.getByText(/Evidence register/i)).toBeVisible();
+
+    const exhibits = rows(await apiGet(page, 'evidence/'));
+    test.skip(exhibits.length === 0, 'no evidence seeded');
+
+    // A sealed generated capture and a sealed seized one are byte-identical
+    // artefacts. If the register cannot tell them apart on screen, neither can
+    // anyone reading it.
+    const body = await page.locator('body').innerText();
+    for (const exhibit of exhibits) {
+      expect(
+        exhibit.provenance,
+        `${exhibit.exhibit_number} has no recorded provenance`,
+      ).toBeTruthy();
+    }
+
+    if (exhibits.some((e) => e.is_demonstration_only)) {
+      expect(body).toContain('SYNTHETIC');
+      expect(body).toContain('NOT EVIDENCE');
+    }
+  });
+
+  test('a synthetic exhibit cannot be mistaken for evidence', async ({ page }) => {
+    await page.goto('/evidence');
+
+    const exhibits = rows(await apiGet(page, 'evidence/'));
+    const demo = exhibits.find((e) => e.is_demonstration_only);
+    test.skip(!demo, 'no synthetic exhibit seeded');
+
+    // Wait for the row rather than for the page load. Reading innerText
+    // straight after goto() passed only because the apiGet above happened to
+    // take longer than the render did — which is not a wait, it is a race that
+    // usually wins. Under a full-suite run it lost.
+    await expect(page.getByText(demo.exhibit_number, { exact: false }).first())
+      .toBeVisible({ timeout: 20_000 });
+
+    const body = await page.locator('body').innerText();
+    // The warning has to name the exhibit it belongs to, not float loose on
+    // the page where it could be read as applying to a different row.
+    expect(body).toContain(demo.exhibit_number);
+    expect(body).toMatch(/SYNTHETIC[^\n]*NOT EVIDENCE/i);
+  });
+});
+
+test.describe('findings trace back to an exhibit', () => {
+  test.beforeEach(async ({ page }) => login(page));
+
+  test('a finding names the sealed exhibit its claim rests on', async ({ page }) => {
+    const findings = rows(await apiGet(page, 'detections/'));
+    test.skip(findings.length === 0, 'no findings seeded');
+
+    for (const finding of findings) {
+      expect(
+        finding.exhibit_number,
+        `finding ${finding.id} (${finding.rule_id}) is not traceable to an exhibit`,
+      ).toBeTruthy();
+    }
+  });
+
+  test('a finding from generated traffic says so on screen', async ({ page }) => {
+    const findings = rows(await apiGet(page, 'detections/'));
+    const demo = findings.find((f) => f.is_demonstration_only);
+    test.skip(!demo, 'no findings from a synthetic exhibit');
+
+    await page.goto(`/detections?q=${encodeURIComponent(demo.subject_ip)}`);
+    await expect(page.getByText('DEMO DATA').first()).toBeVisible();
+  });
+});
+
+test.describe('section 63 certificate', () => {
+  test.beforeEach(async ({ page }) => login(page));
+
+  test('an exhibit exposes its certificates and their completeness', async ({ page }) => {
+    await page.goto('/evidence');
+    await expect(page.getByText(/Section 63 certificates/i).first()).toBeVisible();
+
+    // s.63(4) needs both parts, so a half-signed certificate must say so
+    // rather than presenting itself as valid.
+    const badge = page.getByText(/Both parts signed|DRAFT — Part B unsigned/).first();
+    await expect(badge).toBeVisible();
+  });
+
+  test('the certificate downloads as a real PDF', async ({ page }) => {
+    await page.goto('/evidence');
+
+    test.skip(
+      await apiCount(page, 'certificates/') === 0,
+      'no certificate issued for any exhibit',
+    );
+
+    const button = page.getByRole('button', { name: /Download PDF/i }).first();
+    await expect(button).toBeVisible();
+
+    const [download] = await Promise.all([
+      page.waitForEvent('download'),
+      button.click(),
+    ]);
+    expect(download.suggestedFilename()).toMatch(/^S63-.*\.pdf$/);
+
+    // Assert it is actually a PDF, not an error page saved with a .pdf name
+    const path = await download.path();
+    const fs = await import('node:fs');
+    const header = fs.readFileSync(path).subarray(0, 5).toString();
+    expect(header).toBe('%PDF-');
+  });
+});
+
+test.describe('air-gapped operation', () => {
+  /**
+   * The venue may have no usable internet. A page that quietly depends on a
+   * CDN font or a remote script looks fine on a developer laptop and falls
+   * apart on the day, so this proves the app needs nothing beyond localhost.
+   *
+   * Every request to any other host is aborted, and any attempt is recorded
+   * and asserted against — a failed background fetch that the UI swallows
+   * would otherwise pass unnoticed.
+   */
+  test('the app works with every non-local request blocked', async ({ page }) => {
+    const blocked = [];
+
+    await page.route('**', (route) => {
+      const url = new URL(route.request().url());
+      const local = ['127.0.0.1', 'localhost', '::1'].includes(url.hostname);
+      if (local || url.protocol === 'data:' || url.protocol === 'blob:') {
+        return route.continue();
+      }
+      blocked.push(url.href);
+      return route.abort();
+    });
+
+    await page.goto('/dashboard');
+    await page.waitForURL(/dashboard/, { timeout: 20_000 });
+
+    // Wait for data to actually arrive, rather than asserting against a
+    // half-rendered shell — the sidebar alone would satisfy a loose match.
+    await expect(page.getByText(/Packets/i).first()).toBeVisible({ timeout: 20_000 });
+
+    expect(
+      blocked,
+      `the app reached for external hosts: ${blocked.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  test('findings and evidence pages need no external hosts either', async ({ page }) => {
+    const blocked = [];
+    await page.route('**', (route) => {
+      const url = new URL(route.request().url());
+      const local = ['127.0.0.1', 'localhost', '::1'].includes(url.hostname);
+      if (local || url.protocol === 'data:' || url.protocol === 'blob:') {
+        return route.continue();
+      }
+      blocked.push(url.href);
+      return route.abort();
+    });
+
+    await page.goto('/detections');
+    await expect(page.getByText(/Findings/i).first()).toBeVisible();
+
+    await page.goto('/evidence');
+    await expect(page.getByText(/Evidence register/i)).toBeVisible();
+
+    expect(blocked, `external hosts requested: ${blocked.join(', ')}`).toEqual([]);
+  });
+});
+
+test.describe('the interface claims nothing it cannot do', () => {
+  test.beforeEach(async ({ page }) => login(page));
+
+  test('no controls for actions this tool cannot perform', async ({ page }) => {
+    // These were live-looking buttons wired to nothing. On a tool whose whole
+    // claim is evidentiary integrity, an inert "Purge buffer" control next to
+    // the evidence register is worse than useless.
+    const body = await page.locator('body').innerText();
+    for (const phantom of ['Purge buffer', 'Rotate storage']) {
+      expect(body).not.toContain(phantom);
+    }
+  });
+
+  test('the sidebar capture window reflects the real session', async ({ page }) => {
+    const session = rows(await apiGet(page, 'sessions/'))[0] ?? null;
+
+    test.skip(!session?.capture_start, 'no capture session seeded');
+
+    // The old build showed a hardcoded 2026-08-02 09:14:07 and "2d 04h 11m"
+    const body = await page.locator('body').innerText();
+    expect(body).not.toContain('2d 04h 11m');
+
+    const year = new Date(session.capture_start).getFullYear();
+    expect(body).toContain(String(year));
+  });
+
+  test('search filters findings instead of doing nothing', async ({ page }) => {
+    await page.goto('/detections');
+
+    const subject = rows(await apiGet(page, 'detections/'))[0]?.subject_ip ?? null;
+
+    test.skip(!subject, 'no detections seeded');
+
+    await page.goto(`/detections?q=${encodeURIComponent(subject)}`);
+    await expect(page.getByText(/filtered:/i)).toBeVisible();
+
+    // A filter that matches nothing would also show a chip; assert findings survived
+    await expect(
+      page.getByRole('button', { name: RULE_ID }).first(),
+    ).toBeVisible();
+  });
+});
+
+test.describe('public pages make no false claims', () => {
+  /**
+   * The landing page escaped every earlier check because the suite only ever
+   * visited authenticated routes. It was still rendering "Evidence sealed
+   * 2,417", "Packets / sec 84.2 K" and "UPTIME 2d 04h" over Math.sin
+   * sparklines — months after PROGRESS.md recorded removing exactly those.
+   * These run anonymously, which is how a judge first sees the product.
+   */
+  const PUBLIC = ['/', '/login', '/register'];
+
+  const FABRICATED = [
+    '2,417', '84.2 K', '512.0 M', '1,482',   // invented telemetry figures
+    '2d 04h',                                 // invented uptime
+    'ISOLATION FOREST',                       // no model exists in the codebase
+    'D3 GRAPH ENGINE',                        // no flow-graph page exists
+    'LIVE CAPTURE PREVIEW',                   // nothing is capturing live
+    'LIVE SYSTEM TELEMETRY',                  // pre-auth, nothing could back it
+    'AUTHORIZED DEPLOYMENT',                  // no authority deployed this
+    'TLS 1.3 CHANNEL',                        // demo stack runs over plain HTTP
+  ];
+
+  for (const path of PUBLIC) {
+    test(`${path} shows no fabricated figures or capabilities`, async ({ anonymousPage }) => {
+      await anonymousPage.goto(path);
+      await anonymousPage.waitForLoadState('networkidle');
+      const body = await anonymousPage.locator('body').innerText();
+
+      for (const phrase of FABRICATED) {
+        expect(body, `${path} still shows "${phrase}"`).not.toContain(phrase);
+      }
+    });
+  }
+
+  test('the rule count on the landing page comes from the engine', async ({ anonymousPage, request }) => {
+    // Three separate strings used to carry this number as prose. Adding a rule
+    // made all of them wrong, on the first page a judge sees, with nothing to
+    // catch it.
+    //
+    // Fetched through Playwright's own client rather than from inside the
+    // page: a cross-origin fetch from about:blank has a null origin and is
+    // refused before it reaches the server.
+    const engine = await (await request.get(`${API_BASE}/engine/`)).json();
+
+    await anonymousPage.goto('/');
+    const body = await anonymousPage.locator('body').innerText();
+
+    const WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six',
+                   'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve'];
+    const spelled = WORDS[engine.rule_count] ?? String(engine.rule_count);
+
+    expect(
+      body.toLowerCase(),
+      `landing page should say "${spelled}" rules, matching the engine`,
+    ).toContain(`${spelled} deterministic rules`);
+
+    expect(body).toContain(`v${engine.version}`);
+  });
+
+  test('the landing page does not claim to be tamper-proof', async ({ anonymousPage }) => {
+    // The custody model's own docstring says tamper-EVIDENT, "which is the
+    // honest claim to make about a database table". The marketing copy must
+    // not promise more than the code is willing to.
+    await anonymousPage.goto('/');
+    const body = await anonymousPage.locator('body').innerText();
+    expect(body.toLowerCase()).not.toContain('tamper-proof');
+  });
+});

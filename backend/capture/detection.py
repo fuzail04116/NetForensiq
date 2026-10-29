@@ -1,0 +1,1883 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+"""
+Detection engine — deterministic rules first, model second.
+
+Every rule records the value it observed, the threshold it compared against,
+and where that threshold came from. An investigator asked "why is this
+flagged?" reads the answer off the record; nothing here depends on a model's
+opinion. Thresholds are cited in THRESHOLDS below and in
+research/SPEC_02_DETECTION_ALGORITHMS.md.
+
+Where no citable value exists the constant is tagged OUR_HEURISTIC and that
+tag is carried into the stored evidence, so an overclaim is impossible to make
+by accident.
+"""
+
+import ipaddress
+import math
+import statistics
+from collections import defaultdict
+
+from django.conf import settings
+from django.db import transaction
+from django.db.models import Q
+
+from . import base_rates
+from .models import Detection, Flow
+from .processor import (
+    DEFAULT_IDLE_TIMEOUT, ENTROPY_SAMPLE_BYTES, IDLE_TIMEOUT_SECONDS,
+    MAX_ENTROPY_SAMPLES,
+)
+
+
+# Snort and Suricata both define $HOME_NET — the address space you are
+# defending — and write egress rules against it. Without that notion, a rule
+# meant to catch "an internal host reaching out to something odd" also fires on
+# every scanner on the internet reaching in, which on an internet-facing
+# capture is thousands of alerts. Default is the RFC 1918 private ranges, as
+# in Snort's shipped configuration; override with HOME_NET in settings.
+DEFAULT_HOME_NET = ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', 'fd00::/8')
+SRC_HOME_NET = ('Snort/Suricata $HOME_NET convention; default RFC 1918 private '
+                'address space')
+
+
+def _parse_networks(entries):
+    parsed = []
+    for entry in entries:
+        try:
+            parsed.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            continue
+    return parsed
+
+
+def _home_networks():
+    """The deployment-wide default, used when a capture declares nothing."""
+    return _parse_networks(getattr(settings, 'HOME_NET', None) or DEFAULT_HOME_NET)
+
+
+def session_home_networks(session):
+    """
+    The monitored address space *for this capture*.
+
+    HOME_NET was a single global, which is wrong the moment a second case is
+    loaded: a capture taken inside an office is RFC 1918, and a capture of a
+    public-facing server is not. Analysing both against one setting means one
+    of them is analysed against the wrong network, and every egress rule
+    silently inverts. It is declared per capture at import and falls back to
+    the deployment default only when the officer did not state one.
+    """
+    declared = (getattr(session, 'home_net', '') or '').strip()
+    if not declared:
+        return _home_networks()
+    nets = _parse_networks(e.strip() for e in declared.split(',') if e.strip())
+    return nets or _home_networks()
+
+
+def describe_home_net(source):
+    """
+    The ranges actually used, as a string, for a finding's evidence.
+
+    Takes either a capture session or an already-parsed list of networks.
+
+    It used to take only a session, and anything else fell through
+    `getattr(source, 'home_net', '')` to the empty string and out to the
+    deployment-wide default. So `describe_home_net(session_home_networks(s))` —
+    which reads perfectly — printed the *global* default. The graph endpoint
+    did exactly that: every host had been classified against the capture's own
+    declared range of 10.3.14.101/32, while the caption under the diagram told
+    the reader the monitored network was 10.0.0.0/8, 172.16.0.0/12,
+    192.168.0.0/16, fd00::/8.
+
+    That is the worst class of defect this system can have. Nothing looked
+    broken — the diagram was correct, the classification was correct, and the
+    sentence describing them was false. An officer reading it would have
+    understood the inside/outside boundary to be four private ranges when the
+    tool had drawn a single host, and "outside the monitored network" is the
+    claim an exfiltration finding rests on.
+    """
+    nets = source if isinstance(source, (list, tuple)) else session_home_networks(source)
+    return ', '.join(str(net) for net in nets)
+
+
+def is_internal(ip, networks=None):
+    """
+    True if the address falls inside the monitored network.
+
+    `networks` is the parsed list for the capture under analysis. Omitting it
+    falls back to the deployment default, which is correct for a single-tenant
+    install and wrong for a second capture — so every rule passes it.
+    """
+    if not ip:
+        return False
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    pool = networks if networks is not None else _home_networks()
+    return any(address in net for net in pool)
+
+
+# Destinations that cannot be a remote correspondent, whatever the traffic
+# looks like.
+#
+# Why this is a categorical exclusion and not a tuned threshold
+# ------------------------------------------------------------
+# Measured on 16 captures of ordinary user traffic (research/157), the
+# exfiltration rule reported *"0.1 MB outbound to 239.255.255.250
+# (106876:1)"*. That address is SSDP's multicast group: a host announces
+# itself to it and nothing ever answers, because there is nobody to answer —
+# the packets do not leave the link. The sent:received ratio the rule is built
+# on is not high there, it is undefined, and a ratio of 106876:1 is the
+# arithmetic of dividing by the 1 byte the code substitutes for zero.
+#
+# The same applies to every address below: each is defined by its RFC as
+# link-scoped or non-forwarded, so "data left the network to this host" is not
+# a claim that can be true of it.
+#
+#   224.0.0.0/4       IPv4 multicast              RFC 5771
+#   255.255.255.255   limited broadcast           RFC 919: "must not be forwarded"
+#   169.254.0.0/16    IPv4 link-local             RFC 3927: "A router MUST NOT
+#                                                 forward a packet with an IPv4
+#                                                 Link-Local source or
+#                                                 destination address."
+#   ff00::/8          IPv6 multicast              RFC 4291
+#   fe80::/10         IPv6 link-local             RFC 4291
+#
+# This costs nothing in detection: exfiltration and C2 do not travel by
+# multicast, because multicast does not travel. A host abusing mDNS or SSDP to
+# signal another machine on the same segment is a real if rare technique, and
+# it is a different claim from the one these rules make — it is recorded in
+# research/157 rather than silently covered here.
+LINK_SCOPED_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
+    '224.0.0.0/4', '255.255.255.255/32', '169.254.0.0/16', 'ff00::/8', 'fe80::/10',
+))
+
+
+def is_link_scoped(ip):
+    """True if this address never leaves the local link. See above."""
+    if not ip:
+        return False
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(address in net for net in LINK_SCOPED_NETWORKS)
+
+
+def flow_direction(flow):
+    """
+    (initiator_ip, peer_ip, service_port) for a flow.
+
+    The service port is the *responder's* port — the thing being connected to.
+    Reading dst_port blindly is wrong whenever the capture recorded the
+    responder as the source, which is common for inbound connections, and
+    yields the client's ephemeral port instead of the service.
+    """
+    initiator = flow.initiator_ip or flow.src_ip
+    if initiator == flow.src_ip:
+        return initiator, flow.dst_ip, flow.dst_port
+    return initiator, flow.src_ip, flow.src_port
+
+
+SRC_RITA = 'RITA (Active Countermeasures) pkg/beacon/analyzer.go + etc/rita.yaml'
+SRC_BINWALK = 'binwalk shipped entropy defaults (7.6 rising / 6.8 falling, 1024-byte blocks)'
+SRC_SIMPLE_SCAN = (
+    'ncsa/bro-simple-scan scripts/scan.zeek, read from source: scan_threshold=25 '
+    '(unique host+port combinations for a REMOTE scanner), local_scan_threshold=250 '
+    '(for a LOCAL one), scan_timeout=15min'
+)
+SRC_SNORT3 = 'Snort 3 port_scan inspector defaults (Cisco Talos)'
+SRC_FARNHAM = 'Farnham & Atlasis (2013), DNS tunnelling label length — secondary source only'
+# The CDN false positive, and the two tests that separate it from a tunnel.
+SRC_ELASTIC_DNS = (
+    'Elastic Security, "Plight at the end of the tunnel" (elastic.co/blog/plight-end-tunnel): '
+    'group by registered domain; "subdomains created by DNS tunnels are usually only '
+    'queried once"; tunnels leave "loose ends" — "There is no intention to ever make an '
+    'IP connection to the resolved domain name"'
+)
+SRC_PSL = 'Mozilla Public Suffix List (publicsuffix.org), snapshot shipped in capture/data'
+# Stronger than the Farnham secondary citation: the tunnel tools themselves.
+# RFC 1035 §2.3.4 caps a label at 63 octets and a whole name at 255. Tunnels
+# have to fill that budget to move data, so they sit just under the ceiling —
+# dnscat2 hardcodes MAX_FIELD_LENGTH 62, one octet below the maximum, and
+# iodine's -M defaults to the full 255-octet hostname. Ordinary hostnames are
+# nowhere near it, which is what makes label length discriminating at all.
+SRC_DNS_TUNNEL_TOOLS = (
+    'RFC 1035 §2.3.4 (label ≤63, name ≤255 octets); dnscat2 '
+    'client/tunnel_drivers/driver_dns.c MAX_FIELD_LENGTH=62 (verified against '
+    'source); iodine iodine(8) -M max upstream hostname, default 255'
+)
+SRC_PING = 'ping(8) default payload: 56 bytes Linux / 32 bytes Windows'
+OUR_HEURISTIC = '[OUR HEURISTIC] no citable source; see SPEC_02 heuristics table'
+SRC_ZEEK_IDLE = ('Zeek scripts/base/init-bare.zeek — tcp_inactivity_timeout 5 min, '
+                 'udp_inactivity_timeout 1 min (verified against source, not docs)')
+
+
+# Ports on which a long-lived, unidentified channel is unremarkable.
+#
+# This is NOT the IANA well-known range and must not be described as one. That
+# range is 0-1023; more than a third of the entries below sit outside it
+# (3306, 3389, 5432, 5985, 6379, 8080, 9200, 27017 …) and a few — 8000, 8888,
+# 34567 — are conventions rather than IANA assignments at all. It is a curated
+# list, seeded from the IANA registry and extended with the services that in
+# practice hold sustained sessions on a corporate network.
+#
+# Curated means heuristic, so it is tagged as one. Membership is deliberately
+# generous: a false negative here is better than flagging routine traffic.
+WELL_KNOWN_PORTS = frozenset({
+    20, 21, 22, 23, 25, 53, 67, 68, 69, 80, 110, 119, 123, 135, 137, 138, 139,
+    143, 161, 162, 179, 389, 443, 445, 465, 514, 515, 587, 631, 636, 873, 989,
+    990, 993, 995, 1194, 1433, 1521, 1723, 3128, 3306, 3389, 5060, 5061, 5222,
+    5432, 5900, 5985, 5986, 6379, 8000, 8080, 8443, 8888, 9200, 27017,
+})
+SRC_PORT_LIST = (
+    OUR_HEURISTIC + ' — curated list of ports carrying sustained sessions, seeded '
+    'from the IANA Service Name and Transport Protocol Port Number Registry but '
+    'deliberately extended beyond the 0-1023 well-known range'
+)
+
+
+# How much of the observed data a finding carries with it.
+#
+# These decide what an officer is shown, not what is detected: the counts in
+# each finding are computed over everything, and only the illustrative sample
+# is trimmed. Every finding that trims says so, with the true total beside it,
+# so nobody reads five domain names as the whole set. The full data stays in
+# the flow and DNS tables the finding points at.
+EVIDENCE_SAMPLE_LIMIT = 5
+EVIDENCE_SAMPLE_VALUE_CHARS = 120
+
+
+THRESHOLDS = {
+    # ── beaconing ──
+    'beacon_min_connections': (23, SRC_RITA + ' — DefaultConnectionThresh, counted as '
+                                              'CONNECTIONS between a host pair (not packets '
+                                              'within one connection)'),
+    'beacon_alert_score': (0.80, 'Practitioner guidance (Black Hills InfoSec; Cyb3r-Monk KQL '
+                                 'uses 0.85). RITA itself ranks rather than hard-cuts. '
+                                 '[OUR HEURISTIC, informed by practitioner sources]'),
+    'beacon_skew_iqr_floor': (10, SRC_RITA + ' — Bowley skew suppressed when Q3-Q1 < 10'),
+    'beacon_ds_smallness_norm': (65535, SRC_RITA + ' — data-size smallness normaliser'),
+
+    # ── DNS tunnelling ──
+    'dns_label_length': (52, f'{SRC_DNS_TUNNEL_TOOLS}. Set below the 62–63 octet '
+                             f'ceiling the tools actually emit, so a tunnel that '
+                             f'pads slightly short is still caught. Corroborated by '
+                             f'{SRC_FARNHAM}'),
+    'dns_label_entropy': (3.5, OUR_HEURISTIC + ' — grounded in Base32/64 alphabet-entropy ceiling'),
+    'dns_entropy_min_label_len': (20, OUR_HEURISTIC),
+    'dns_unique_subdomains': (50, OUR_HEURISTIC + ' — scaled down from resolver-scale figures'),
+
+    # ── port scan ──
+    'scan_unique_ports': (25, f'{SRC_SIMPLE_SCAN}; the same figure as Snort 3 '
+                              f'port_scan ports=25 ({SRC_SNORT3})'),
+    # bro-simple-scan holds a host inside HOME_NET to a far higher bar, because
+    # internal hosts legitimately touch many ports (backup agents, monitoring,
+    # vulnerability scanners run by the organisation itself).
+    'scan_unique_ports_local': (250, SRC_SIMPLE_SCAN + ' — local_scan_threshold'),
+    # NOT a fixed rolling window. bro-simple-scan's comment is explicit:
+    # "Failed connection attempts are tracked until not seen for this
+    # interval" — an inactivity timeout. An earlier version of this file cited
+    # it as a 15-minute rolling window and implemented neither.
+    'scan_inactivity_timeout': (900, SRC_SIMPLE_SCAN + ' — scan_timeout, an INACTIVITY '
+                                                       'timeout: probing is one episode '
+                                                       'until the source goes quiet for '
+                                                       'this long'),
+
+    # ── exfiltration ──
+    # binwalk's 7.6/6.8 pair is hysteresis for walking *through* a file:
+    # entropy rising past 7.6 opens a high-entropy region, falling below 6.8
+    # closes it. We hold one averaged figure per flow, with no sequence to
+    # track, so only the rising edge transfers. The falling edge was published
+    # here for a while and applied by nothing.
+    'exfil_entropy_high': (7.6, SRC_BINWALK + ' — rising edge only; the falling edge is '
+                                'hysteresis for intra-file scanning and has no meaning '
+                                'for a per-flow average'),
+    'exfil_ratio': (10.0, OUR_HEURISTIC + ' — outbound:inbound, loosely informed by practitioner guidance'),
+    # An absolute byte floor cannot work across capture scales: 50 MB is
+    # reasonable on a day of enterprise traffic and absurd on a 40-minute
+    # capture. The volume test is therefore relative to the capture itself
+    # (95th percentile of outbound bytes), with a small absolute floor purely
+    # to stop trivial flows qualifying. Both values are reported in evidence.
+    'exfil_volume_percentile': (95, OUR_HEURISTIC + ' — flow must be in the top 5% of '
+                                                    'outbound volume for its own capture'),
+    'exfil_absolute_floor': (100 * 1024, OUR_HEURISTIC + ' — 100 KB, suppresses trivial flows only'),
+
+    # ── ICMP tunnelling ──
+    # The rule compares avg_packet_size, which is the whole frame — IP and
+    # ICMP headers included. Naming it 'payload' and citing a payload
+    # baseline described a stricter test than the code performs: a stock
+    # Linux ping is 56 B of payload in an 84 B packet, so a '100-byte
+    # payload' gate is really a ~72-byte payload gate.
+    'icmp_packet_bytes': (100, OUR_HEURISTIC + f' — measured on the whole frame. '
+                              f'{SRC_PING}, which is 84 B and 60 B on the wire '
+                              f'once the 20 B IP and 8 B ICMP headers are counted'),
+    # A tunnel is a sustained exchange. A single oversized echo reply is an
+    # ordinary answer to a scanner that sent a large ping payload — echo
+    # replies mirror the request. On a real week-long capture, 238 of 461
+    # remaining findings were single-packet flows.
+    'icmp_min_packets': (10, OUR_HEURISTIC + ' — a covert channel carries a stream; '
+                                             'one-off oversized echoes are ping replies'),
+
+    # ── keepalive beaconing inside one persistent connection ──
+    # RITA's model assumes a beacon opens a NEW connection each time. Remote
+    # access trojans frequently hold one TCP connection open and beacon inside
+    # it, which RITA's connection counting cannot see. This is our own rule for
+    # that case, scored with RITA's MADM formula so the alert threshold means
+    # the same thing in both.
+    'keepalive_min_intervals': (20, OUR_HEURISTIC + ' — below ~20 samples the MAD estimate '
+                                                    'is too unstable to act on'),
+    # A period, not a burst.
+    #
+    # The beacon rules reported "Periodic callback to 161.69.13.21 every ~0s"
+    # on ordinary traffic (research/157). A median interval at or near zero is
+    # not a schedule: it is packets arriving together, and every one of these
+    # rules is a claim about a schedule. One second is the floor because below
+    # it the aggregator's own model does not distinguish gaps — flows are cut
+    # on idle timeouts measured in tens of seconds (IDLE_TIMEOUT_SECONDS), so
+    # sub-second structure inside a flow is transport behaviour, not cadence.
+    #
+    # It is deliberately a floor and not a filter on fast beacons. Real C2 does
+    # beacon every few seconds, and RITA's own design — a minimum of 23
+    # connections, "Since analyzing hosts that have fewer than at least one
+    # connection per hour could significantly increase both the analysis time
+    # and the number of false positives" — targets the slower end. Excluding
+    # everything under a minute would be tuning against this corpus rather than
+    # against a defect, so it is not done here; what the measured benign rate
+    # says about fast keepalives is reported in research/157 instead.
+    'beacon_min_period': (1.0, OUR_HEURISTIC + ' — a median interval below one second '
+                                               'describes a burst, not a periodic callback'),
+
+    # risk_score is a 0-100 figure on the dashboard's "Flagged flows" card and
+    # the default sort of the flow table. It came from four bare literals with
+    # no source and no tag — exactly what the provenance endpoint exists to
+    # prevent. Published here and read from here.
+    'risk_score_low': (10, OUR_HEURISTIC + ' — flow risk score for a low-severity finding'),
+    'risk_score_medium': (35, OUR_HEURISTIC + ' — medium'),
+    'risk_score_high': (70, OUR_HEURISTIC + ' — high'),
+    'risk_score_critical': (95, OUR_HEURISTIC + ' — critical'),
+
+    # ── severity and confidence ──
+    # These decide the colour, the ranking and the urgency an officer sees, so
+    # they are as consequential as any detection threshold. They were literals
+    # buried in the rule bodies with no source and no heuristic tag, which is
+    # exactly the thing the provenance endpoint exists to prevent.
+    'beacon_severity_high_score': (0.90, OUR_HEURISTIC + ' — beacon score at which a '
+                                                         'finding is raised from medium '
+                                                         'to high'),
+    'scan_syn_ratio_high': (0.80, OUR_HEURISTIC + ' — share of connections that are SYN '
+                                                  'without a completed handshake before a '
+                                                  'scan is raised to high'),
+    'unknown_channel_confidence': (0.60, OUR_HEURISTIC + ' — fixed confidence: the rule is '
+                                                         'categorical, so there is no '
+                                                         'observed magnitude to scale'),
+    # Confidence is reported as observed/(threshold x N), capped at 1.0. N is a
+    # presentation choice about how far past a threshold counts as certain, not
+    # a measured quantity, and is labelled as such.
+    'confidence_scale_multiplier': (4, OUR_HEURISTIC + ' — a finding reaches full '
+                                                       'confidence at four times its '
+                                                       'threshold'),
+
+    # ── flow aggregation (not a detection threshold, but it shapes every one
+    #    of them: it decides where one conversation ends and the next begins) ──
+    # Read from processor.IDLE_TIMEOUT_SECONDS rather than restated, so the
+    # published figure cannot drift from the one actually applied. These
+    # were duplicated as literals here and happened to agree.
+    'corroboration_distinct_rules': (
+        3,
+        '[OUR HEURISTIC] Number of independent rules that must implicate the '
+        'same host before the finding set is summarised as one CRITICAL '
+        'observation. Three is chosen because two rules often share an input '
+        '(a beacon and a covert channel can be the same flow seen twice) '
+        'while three rarely do. It adds no new evidence — it says that '
+        'evidence already recorded points repeatedly at one address.',
+    ),
+    'entropy_max_samples': (
+        MAX_ENTROPY_SAMPLES,
+        '[OUR HEURISTIC] Memory bound on payload sampling. payload_entropy is '
+        'the mean of at most this many samples per flow, taken in arrival '
+        'order so a capture replays identically. Not a test — it conditions '
+        'the measurement that exfil_entropy_high is applied to.',
+    ),
+    'entropy_sample_bytes': (
+        ENTROPY_SAMPLE_BYTES,
+        '[OUR HEURISTIC] Bytes measured per entropy sample. Same status as '
+        'entropy_max_samples: it shapes the estimate, it is not a threshold.',
+    ),
+    'flow_idle_timeout_tcp': (IDLE_TIMEOUT_SECONDS['TCP'], SRC_ZEEK_IDLE),
+    'flow_idle_timeout_udp': (IDLE_TIMEOUT_SECONDS['UDP'], SRC_ZEEK_IDLE),
+    'flow_idle_timeout_icmp': (IDLE_TIMEOUT_SECONDS['ICMP'], SRC_ZEEK_IDLE),
+    'flow_idle_timeout_default': (DEFAULT_IDLE_TIMEOUT,
+                                  SRC_ZEEK_IDLE + ' — protocols not listed above'),
+
+    # ── unrecognised long-lived channel ──
+    'unknown_channel_min_duration': (60, OUR_HEURISTIC + ' — long enough to be a session '
+                                                         'rather than a probe or a failed '
+                                                         'connection attempt'),
+    'unknown_channel_ports': ('not in the curated sustained-session port list',
+                              SRC_PORT_LIST),
+}
+
+
+# Entries that shape detection without being applied by any single rule.
+# They are published because they change what the rules see — where one
+# conversation ends and the next begins — but a reader must not take them for
+# a test some rule performs.
+INFORMATIONAL_THRESHOLDS = frozenset({
+    'entropy_max_samples',
+    'entropy_sample_bytes',
+    # Ranking and presentation, not tests. They decide how findings are
+    # ordered and how confident a finding says it is; none of them decides
+    # whether a rule fires, so listing them beside the beacon threshold as
+    # though they did would overstate how much of the engine is invented.
+    'risk_score_low',
+    'risk_score_medium',
+    'risk_score_high',
+    'risk_score_critical',
+    'confidence_scale_multiplier',
+    'flow_idle_timeout_tcp',
+    'flow_idle_timeout_udp',
+    'flow_idle_timeout_icmp',
+    'flow_idle_timeout_default',
+})
+
+
+def _t(name):
+    """Threshold value only."""
+    return THRESHOLDS[name][0]
+
+
+def _cite(name):
+    """(value, source) for embedding in a Detection's evidence."""
+    value, source = THRESHOLDS[name]
+    return {'threshold': value, 'source': source}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# RITA beacon scoring
+# ──────────────────────────────────────────────────────────────────────────
+
+def _percentile(sorted_values, p):
+    """
+    RITA's percentile: round(p * (n-1)), 0-indexed, no interpolation.
+
+    Matching this exactly matters — at low sample counts the choice of
+    percentile method materially changes skew and MADM.
+    """
+    if not sorted_values:
+        return 0.0
+    idx = int(round(p * (len(sorted_values) - 1)))
+    return sorted_values[max(0, min(idx, len(sorted_values) - 1))]
+
+
+def bowley_skewness(sorted_values):
+    """
+    (Q1 + Q3 - 2*Q2) / (Q3 - Q1).
+
+    Returns 0 when the distribution is too narrow or degenerate to score,
+    mirroring RITA's guard conditions rather than emitting a wild value.
+    """
+    if len(sorted_values) < 3:
+        return 0.0
+    q1 = _percentile(sorted_values, 0.25)
+    q2 = _percentile(sorted_values, 0.50)
+    q3 = _percentile(sorted_values, 0.75)
+
+    if (q3 - q1) < _t('beacon_skew_iqr_floor'):
+        return 0.0
+    if q2 == q1 or q2 == q3:
+        return 0.0
+    return (q1 + q3 - 2 * q2) / (q3 - q1)
+
+
+def madm(values, centre=None):
+    """Median absolute deviation about the median."""
+    if not values:
+        return 0.0
+    med = centre if centre is not None else statistics.median(values)
+    return statistics.median([abs(v - med) for v in values])
+
+
+def _ceil3(x):
+    return math.ceil(x * 1000) / 1000
+
+
+def beacon_subscores(intervals, sizes):
+    """
+    RITA's timestamp and data-size subscores.
+
+    Implements the current analyzer.go behaviour (MADM divided by the median
+    interval), not the stale README formula which uses a fixed divisor of 30.
+    """
+    result = {'ts_score': 0.0, 'ds_score': 0.0}
+
+    nonzero = sorted(i for i in intervals if i > 0)
+    if len(nonzero) >= 2:
+        ts_skew_score = 1 - abs(bowley_skewness(nonzero))
+        ts_mid = statistics.median(nonzero)
+        ts_madm = madm(nonzero, ts_mid)
+        ts_madm_score = max(0.0, 1 - (ts_madm / ts_mid)) if ts_mid > 0 else 0.0
+        result['ts_score'] = _ceil3((ts_skew_score + ts_madm_score) / 2)
+        result['ts_skew_score'] = round(ts_skew_score, 4)
+        result['ts_madm_score'] = round(ts_madm_score, 4)
+        result['interval_median'] = round(ts_mid, 4)
+
+    sizes = sorted(s for s in sizes if s > 0)
+    if len(sizes) >= 2:
+        ds_skew_score = 1 - abs(bowley_skewness(sizes))
+        ds_mid = statistics.median(sizes)
+        ds_madm_score = max(0.0, 1 - (madm(sizes, ds_mid) / ds_mid)) if ds_mid > 0 else 0.0
+        try:
+            ds_mode = statistics.mode(sizes)
+        except statistics.StatisticsError:
+            ds_mode = ds_mid
+        ds_smallness = max(0.0, 1 - (ds_mode / _t('beacon_ds_smallness_norm')))
+        result['ds_score'] = _ceil3((ds_skew_score + ds_madm_score + ds_smallness) / 3)
+        result['ds_skew_score'] = round(ds_skew_score, 4)
+        result['ds_madm_score'] = round(ds_madm_score, 4)
+        result['ds_smallness_score'] = round(ds_smallness, 4)
+
+    return result
+
+
+def score_connection_beacon(intervals, sizes):
+    """
+    Composite RITA score over inter-connection intervals and payload sizes.
+
+    RITA weights timestamp and data-size subscores equally. Its duration and
+    histogram subscores need 6 h and 11 h of activity respectively, so they are
+    omitted on shorter captures and the score is renormalised over what could
+    actually be computed — recorded in the evidence so the omission is visible
+    rather than silently depressing every short capture's score.
+    """
+    subscores = beacon_subscores(intervals, sizes)
+
+    components = {}
+    if 'ts_skew_score' in subscores:
+        components['ts'] = subscores['ts_score']
+    if 'ds_skew_score' in subscores:
+        components['ds'] = subscores['ds_score']
+    if not components:
+        return 0.0, {'omitted_subscores': ['ts and ds (insufficient samples)']}
+
+    score = round(sum(components.values()) / len(components), 4)
+    detail: dict = dict(subscores)
+    detail['components'] = {k: round(v, 4) for k, v in components.items()}
+    detail['omitted_subscores'] = ['duration (needs >=6h)', 'histogram (needs >=11h)']
+    detail['renormalised'] = True
+    detail['interval_median_s'] = subscores.get('interval_median', 0.0)
+    return score, detail
+
+
+# `score_beacon(flow)` used to live here: a per-flow scorer that was never
+# called by anything. It carried two decision thresholds (6 h and 11 h) that
+# appeared in no THRESHOLDS entry and no source string, in the file that is
+# this project's provenance contract. Worse, its evidence dict reported
+# `renormalised: False` whenever a flow ran past 11 hours — asserting the full
+# RITA composite had been computed when only one of four subscores ever was.
+#
+# It is deleted rather than fixed. rule_beaconing scores host *pairs* through
+# score_connection_beacon(), which is what RITA actually does; a per-flow
+# scorer was a leftover from when a 5-tuple was mistaken for a connection.
+
+# ──────────────────────────────────────────────────────────────────────────
+# Rules
+# ──────────────────────────────────────────────────────────────────────────
+
+def rule_beaconing(session):
+    """
+    RITA's beacon model: repeated CONNECTIONS between a host pair.
+
+    This counts connections between (initiator, peer), not packets inside one
+    connection. The distinction is the whole algorithm — an earlier version of
+    this rule used packets-within-a-flow as a stand-in for RITA's connection
+    count, which happens to agree on synthetic traffic that opens one
+    connection per beacon, and is meaningless on a real capture where a single
+    TCP session carries thousands of packets. Real malware traffic exposed it.
+
+    Because we hold each connection's start time, the intervals here are true
+    inter-connection gaps, so the full Bowley-skew + MADM score can be computed
+    rather than the dispersion component alone.
+    """
+    home = session_home_networks(session)
+    findings = []
+    min_conns = _t('beacon_min_connections')
+    alert = _t('beacon_alert_score')
+
+    pairs = defaultdict(list)
+    for flow in session.flows.all():
+        initiator = flow.initiator_ip or flow.src_ip
+        peer = flow.dst_ip if initiator == flow.src_ip else flow.src_ip
+        pairs[(initiator, peer)].append(flow)
+
+    for (initiator, peer), flows in pairs.items():
+        if len(flows) < min_conns:
+            continue
+        # C2 beaconing is by definition an internal host calling *out* to a
+        # controller. An external host connecting in repeatedly is a scanner,
+        # and RECON_PORT_SCAN already covers it. On a real internet-facing
+        # capture every one of 155 "beacons" was inbound scanning.
+        if not is_internal(initiator, home) or is_internal(peer, home):
+            continue
+        if is_link_scoped(peer):
+            continue
+
+        flows.sort(key=lambda f: f.first_seen)
+        starts = [f.first_seen.timestamp() for f in flows]
+        intervals = [b - a for a, b in zip(starts, starts[1:])]
+        if len(intervals) < 2:
+            continue
+        # A schedule, not a burst. See the beacon_min_period threshold: this
+        # rule reported "Periodic callback to 161.69.13.21 every ~0s" on
+        # ordinary traffic, which is a browser opening several connections at
+        # once, not a callback.
+        if statistics.median(intervals) < _t('beacon_min_period'):
+            continue
+
+        sizes = [(f.bytes_sent or 0) for f in flows]
+        score, detail = score_connection_beacon(intervals, sizes)
+        if score < alert:
+            continue
+
+        period = detail.get('interval_median_s', 0.0)
+        ports = sorted({f.dst_port for f in flows if f.dst_port})
+        findings.append(Detection(
+            session=session, flow=flows[0],
+            rule_id='C2_BEACON_PERIODIC',
+            title=f'Periodic callback to {peer} every ~{period:.0f}s',
+            category='command_and_control',
+            severity=(Detection.Severity.HIGH
+                      if score >= _t('beacon_severity_high_score')
+                      else Detection.Severity.MEDIUM),
+            method=Detection.Method.RULE,
+            confidence=min(score, 1.0),
+            subject_ip=initiator,
+            rationale=(
+                f'{initiator} opened {len(flows)} separate connections to {peer} '
+                f'(port(s) {", ".join(map(str, ports)) or "n/a"}) at a median interval of '
+                f'{period:.2f}s. Automated callbacks cluster tightly around a target '
+                f'period; human-driven traffic does not. Scored {score:.3f} against an '
+                f'alert threshold of {alert}. Note: legitimate polling software (NTP, '
+                f'monitoring agents, update checkers) also produces regular intervals and '
+                f'must be ruled out by an analyst.'
+            ),
+            evidence={
+                'observed_score': score,
+                'connection_count': len(flows),
+                **_cite('beacon_alert_score'),
+                'min_connections': _cite('beacon_min_connections'),
+                'algorithm': SRC_RITA,
+                **detail,
+            },
+        ))
+    return findings
+
+
+def rule_beaconing_keepalive(session):
+    """
+    Beaconing *inside* one persistent connection.
+
+    A remote access trojan often holds a single TCP session open and sends
+    periodic keepalives down it. RITA never sees this — it counts connections,
+    and there is only ever one. Scored with RITA's MADM formula so a score here
+    means what a score there means, but the rule itself is ours.
+    """
+    home = session_home_networks(session)
+    findings = []
+    candidates = defaultdict(list)
+    alert = _t('beacon_alert_score')
+    min_intervals = _t('keepalive_min_intervals')
+    min_period = _t('beacon_min_period')
+
+    for flow in session.flows.filter(interval_count__gte=min_intervals):
+        median = flow.interval_median or 0.0
+        if median < min_period:
+            continue
+
+        initiator, peer, _ = flow_direction(flow)
+        if not is_internal(initiator, home) or is_internal(peer, home):
+            continue  # egress only — see rule_beaconing
+        if is_link_scoped(peer):
+            # SSDP announcements to 239.255.255.250 are as regular as any
+            # beacon and are not a callback to anywhere.
+            continue
+
+        # RITA's MADM subscore, applied to intra-connection send intervals.
+        score = _ceil3(max(0.0, 1 - (flow.interval_mad / median)))
+        if score < alert:
+            continue
+
+        peer = flow.dst_ip if (flow.initiator_ip or flow.src_ip) == flow.src_ip else flow.src_ip
+        subject = flow.initiator_ip or flow.src_ip
+        candidates[(subject, peer, flow.dst_port)].append((score, median, flow))
+    # One finding per (host, peer, port), not per connection.
+    #
+    # Measured on ordinary traffic (research/157) this rule produced 1,150
+    # findings across 16 captures, 340 of them about one host talking to one
+    # AWS address — the same observation, restated once per connection. Zeek's
+    # notice framework fixes this with an `identifier` and a suppression
+    # interval: "The identifier string should be unique for a single instance
+    # of the notice ... for the purpose of deduplicating notices", and without
+    # one, suppression never happens at all. The identity here is the three
+    # things the finding is about: who, to where, on what port.
+    #
+    # Nothing is hidden: the count of connections carrying the pattern is on
+    # the finding, and every flow remains in evidence. What changes is that
+    # 340 restatements cannot bury one real finding further down the list.
+    for (subject, peer, port), seen in candidates.items():
+        seen.sort(key=lambda item: -item[0])
+        score, median, flow = seen[0]
+        repeats = len(seen)
+        findings.append(Detection(
+            session=session, flow=flow,
+            rule_id='C2_BEACON_KEEPALIVE',
+            title=(f'Regular keepalive to {peer}:{port} every ~{median:.1f}s'
+                   + (f' ({repeats} connections)' if repeats > 1 else '')),
+            category='command_and_control',
+            severity=Detection.Severity.MEDIUM,
+            method=Detection.Method.RULE,
+            confidence=min(score, 1.0),
+            subject_ip=flow.initiator_ip or flow.src_ip,
+            rationale=(
+                f'A single connection to {peer}:{flow.dst_port} stayed open for '
+                f'{flow.duration_seconds:.0f}s and sent {flow.interval_count + 1} packets at a '
+                f'median interval of {median:.2f}s (MAD {flow.interval_mad:.2f}s, '
+                f'dispersion {flow.interval_dispersion:.3f}). Periodicity this tight inside '
+                f'one long-lived session is characteristic of a keepalive, which may be a '
+                f'remote access trojan holding a channel open — or an entirely ordinary '
+                f'application heartbeat. This rule is ours, not RITA\'s: RITA counts '
+                f'connections and would see only one here.'
+            ),
+            evidence={
+                'observed_score': score,
+                'scoring_formula': 'RITA MADM subscore (1 - MAD/median) applied to '
+                                   'intra-connection send intervals',
+                **_cite('beacon_alert_score'),
+                'min_intervals': _cite('keepalive_min_intervals'),
+                'interval_median_s': median,
+                'interval_mad_s': flow.interval_mad,
+                'dispersion': flow.interval_dispersion,
+                'sample_count': flow.interval_count,
+                'connections_with_this_pattern': repeats,
+                'min_period': _cite('beacon_min_period'),
+                'rule_provenance': OUR_HEURISTIC,
+            },
+        ))
+    return findings
+
+
+def rule_unknown_long_channel(session):
+    """
+    A sustained conversation on a non-standard port that we cannot identify.
+
+    Neither a recognised application protocol nor a TLS SNI, held open for
+    minutes, to a port outside the well-known range. That combination is not
+    proof of anything — but it is the shape of a covert channel, and it is
+    cheap for an analyst to rule out.
+    """
+    home = session_home_networks(session)
+    findings = []
+    min_duration = _t('unknown_channel_min_duration')
+
+    for flow in session.flows.filter(
+        duration_seconds__gte=min_duration, protocol='TCP',
+    ):
+        initiator, peer, service_port = flow_direction(flow)
+
+        # Egress only. An external host connecting *in* to an odd port is a
+        # scanner, not a covert channel, and on an internet-facing capture
+        # there are thousands of them.
+        if not is_internal(initiator, home) or is_internal(peer, home):
+            continue
+        if service_port in WELL_KNOWN_PORTS:
+            continue
+        if flow.app_protocol or flow.tls_sni:
+            continue
+        if not flow.bytes_sent or not flow.bytes_received:
+            continue  # one-directional: a stalled connection, not a channel
+        # A refused or unanswered connection is not a channel either, and the
+        # byte check above cannot see that: bytes are frame lengths, so a bare
+        # 54-byte RST/ACK from the target counts as "received". A TCP connection
+        # that completed its handshake (RFC 9293 s.3.5) has the initiator sending
+        # at least SYN and ACK and the responder at least SYN-ACK and one more
+        # segment; a SYN answered by RST is one packet each way.
+        #
+        # Found on a real Mirai capture (malware-traffic-analysis.net,
+        # 2025-12-17): the bot's sweep of TCP/37215 — the Huawei HG532 exploit
+        # port — left 3,768 SYN→RST flows, 1 packet each way, that this rule
+        # reported as 3,768 "unidentified channels" against one host. The bot's
+        # real C2 conversation (23 packets out, 19 back) is unaffected.
+        if flow.packets_sent < 2 or flow.packets_received < 2:
+            continue
+
+        findings.append(Detection(
+            session=session, flow=flow,
+            rule_id='COVERT_CHANNEL_UNKNOWN_PORT',
+            title=f'Unidentified {flow.duration_seconds:.0f}s channel to '
+                  f'{peer}:{service_port}',
+            category='command_and_control',
+            severity=Detection.Severity.MEDIUM,
+            method=Detection.Method.RULE,
+            confidence=_t('unknown_channel_confidence'),
+            subject_ip=initiator,
+            rationale=(
+                f'{initiator} held a connection to '
+                f'{peer}:{service_port} open for {flow.duration_seconds:.0f}s, '
+                f'exchanging {flow.bytes_sent:,} bytes out and {flow.bytes_received:,} in. '
+                f'The port is not one we recognise as carrying sustained sessions, no application '
+                f'protocol was identified, and no TLS SNI was presented — so there is '
+                f'nothing declaring what this traffic is. Ordinary encrypted traffic on 443 '
+                f'announces its destination hostname in the SNI; this does not. Benign '
+                f'explanations exist (peer-to-peer software, games, bespoke line-of-business '
+                f'applications) and an analyst should rule them out.'
+            ),
+            evidence={
+                'duration_seconds': flow.duration_seconds,
+                'service_port': service_port,
+                'initiator': initiator,
+                'peer': peer,
+                'direction': 'egress (initiator inside HOME_NET)',
+                'home_net': describe_home_net(session),
+                'home_net_source': SRC_HOME_NET,
+                'app_protocol': flow.app_protocol or None,
+                'tls_sni': flow.tls_sni or None,
+                'payload_entropy': flow.payload_entropy,
+                'entropy_measured_over': (
+                    f'{flow.entropy_sample_count} sample(s) of up to '
+                    f'{ENTROPY_SAMPLE_BYTES} bytes — see entropy_max_samples'
+                ),
+                'bytes_sent': flow.bytes_sent,
+                'bytes_received': flow.bytes_received,
+                **_cite('unknown_channel_min_duration'),
+                'port_list_source': _cite('unknown_channel_ports'),
+                'rule_provenance': OUR_HEURISTIC,
+            },
+        ))
+    return findings
+
+
+def _dns_loose_ends(session):
+    """
+    Which (host, name) lookups were followed by a connection to the answer.
+
+    Elastic's test for telling a CDN from a tunnel: ordinary resolution exists
+    to reach an address, so the host goes on to talk to what it looked up; a
+    tunnel "has no intention to ever make an IP connection to the resolved
+    domain name". Answered with addresses the host then spoke to, a name is
+    *used*; anything else — no address in the reply, or an address the host
+    never contacted in this capture — is a loose end.
+
+    Returns (is_loose, evidence_available). `evidence_available` is False when
+    the capture holds no conversation other than DNS itself (the CTU DNS-only
+    captures are exactly that): there is then nothing to test against, and the
+    finding must say so rather than treat every name as a loose end.
+    """
+    answers = defaultdict(set)
+    for name, addresses in session.dns_records.exclude(response_ip='').values_list(
+            'query_name', 'response_ip'):
+        answers[name.lower()].update(a.strip() for a in addresses.split(',') if a.strip())
+
+    peers = defaultdict(set)
+    non_dns = 0
+    for src, dst, port, proto in session.flows.values_list(
+            'src_ip', 'dst_ip', 'dst_port', 'app_protocol'):
+        if proto == 'DNS' or port == 53:
+            continue
+        non_dns += 1
+        peers[src].add(dst)
+        peers[dst].add(src)
+
+    def is_loose(src_ip, name):
+        return not (answers.get(name.lower(), set()) & peers.get(src_ip, set()))
+
+    return is_loose, non_dns > 0
+
+
+def rule_dns_tunnelling(session):
+    """
+    DNS used as a data channel: long encoded labels, or a flood of one-off
+    names under one domain.
+
+    Both tests are counted per *registered domain* (Public Suffix List) and
+    over *loose ends* only — names the host never went on to connect to — which
+    is Elastic's published answer to the CDN false positive this rule used to
+    produce on 4 of 16 ordinary captures: `66 unique subdomains of
+    amazonaws.com`, `59 of akamaiedge.net`, `662 of in-addr.arpa`
+    (research/157, research/158).
+    """
+    from . import psl
+
+    findings = []
+    label_len = _t('dns_label_length')
+    uniq_thresh = _t('dns_unique_subdomains')
+    entropy_thresh = _t('dns_label_entropy')
+    entropy_min_len = _t('dns_entropy_min_label_len')
+    is_loose, connection_evidence = _dns_loose_ends(session)
+    method_note = (
+        'Counted per registered domain (Public Suffix List '
+        f'{psl.version()}), and only over names this host did not go on to connect to. '
+        + ('' if connection_evidence else
+           'This capture holds no traffic other than DNS, so whether the host used '
+           'the answers cannot be tested here and every name has been counted.')
+    )
+
+    # Long, high-entropy labels.
+    # Aggregated per (source, registered domain) rather than raised per query:
+    # one tunnel produces hundreds of oversized queries, and an analyst facing
+    # 500 near-identical alerts stops reading them. One finding, with the
+    # evidence rolled up, is both more usable and more honest about what was
+    # observed.
+    long_label = defaultdict(lambda: {
+        'count': 0, 'max_len': 0, 'max_entropy': 0.0,
+        'samples': [], 'flow': None, 'used': 0,
+    })
+
+    # Length AND entropy, not length OR entropy.
+    #
+    # The widening form was tried first — flag anything past 52 characters, or
+    # anything past 20 characters that is also high-entropy — on the reasoning
+    # that a tunnel under a long parent domain has less room per label. On real
+    # traffic it immediately flagged
+    # `sunshine-bizrate-inc-software.trycloudflare.com` as DNS tunnelling.
+    #
+    # That host is genuinely malicious: it is the AsyncRAT campaign's payload
+    # delivery infrastructure, named in the published ground truth. But it is a
+    # Cloudflare quick-tunnel hostname made of dictionary words, not encoded
+    # payload, and calling it a DNS tunnel is a wrong finding that happens to
+    # point at a right host. An officer acting on the stated reason would be
+    # looking for something that is not there.
+    #
+    # Hyphenated English words sit at roughly the same Shannon entropy as
+    # hex-encoded payload (~3.5-4.0 bits/char), so entropy cannot widen the net
+    # on its own. It can usefully narrow it: a label that is both at tunnel
+    # length and high-entropy is a stronger call than length alone. The minimum
+    # length guard remains because entropy over a handful of characters is too
+    # unstable to act on.
+    matches = session.dns_records.filter(
+        subdomain_length__gte=max(label_len, entropy_min_len),
+        query_entropy__gte=entropy_thresh,
+    )
+    for record in matches:
+        parent = psl.registered_domain(record.query_name)
+        entry = long_label[(record.src_ip, parent)]
+        if connection_evidence and not is_loose(record.src_ip, record.query_name):
+            # A long hashed hostname the browser then fetched from — gstatic,
+            # a CDN edge — is a long name, not a channel.
+            entry['used'] += 1
+            continue
+        entry['count'] += 1
+        entry['max_len'] = max(entry['max_len'], record.subdomain_length)
+        entry['max_entropy'] = max(entry['max_entropy'], record.query_entropy)
+        entry['flow'] = entry['flow'] or record.flow
+        if len(entry['samples']) < EVIDENCE_SAMPLE_LIMIT:
+            entry['samples'].append(record.query_name[:EVIDENCE_SAMPLE_VALUE_CHARS])
+
+    for (src_ip, parent), entry in long_label.items():
+        if not entry['count']:
+            continue
+        findings.append(Detection(
+            session=session, flow=entry['flow'],
+            rule_id='DNS_TUNNEL_LONG_LABEL',
+            title=f'{entry["count"]} oversized DNS labels under {parent} from {src_ip}',
+            category='exfiltration',
+            severity=Detection.Severity.HIGH,
+            method=Detection.Method.RULE,
+            confidence=min(entry['max_len'] / (label_len * _t('confidence_scale_multiplier')), 1.0),
+            subject_ip=src_ip,
+            rationale=(
+                f'{src_ip} issued {entry["count"]} queries under {parent} whose subdomain '
+                f'labels reach {entry["max_len"]} characters (peak entropy '
+                f'{entry["max_entropy"]:.2f} bits/char), and did not go on to connect to '
+                f'any address they returned. DNS tunnelling encodes payload into '
+                f'subdomain labels, producing long high-entropy names that are never '
+                f'used to reach anything; ordinary long hostnames are fetched from. '
+                f'Flagged only when a label reaches both {label_len} characters '
+                f'and {entropy_thresh} bits/char — length alone catches hostnames made of '
+                f'dictionary words, which are suspicious for other reasons but are not '
+                f'tunnels. DNS-based reputation lookups (antivirus, spam blocklists) '
+                f'carry data in the name by design and must be ruled out. {method_note}'
+            ),
+            evidence={
+                'observed_query_count': entry['count'],
+                'queries_followed_by_a_connection_excluded': entry['used'],
+                'connection_evidence_available': connection_evidence,
+                'observed_max_label_length': entry['max_len'],
+                'observed_max_entropy': entry['max_entropy'],
+                'registered_domain': parent,
+                'public_suffix_list': psl.version(),
+                'samples': entry['samples'],
+                'samples_are_illustrative': (
+                    f'showing {len(entry["samples"])} of {entry["count"]} matching '
+                    f'queries; the full set is in this session\'s DNS records'
+                ),
+                'matched_on': 'label length AND entropy, both required',
+                'method': SRC_ELASTIC_DNS,
+                **_cite('dns_label_length'),
+                'entropy_threshold': _cite('dns_label_entropy'),
+                'entropy_min_length': _cite('dns_entropy_min_label_len'),
+            },
+        ))
+
+    # Many distinct, never-used subdomains under one registered domain.
+    queries = defaultdict(lambda: defaultdict(int))
+    for src_ip, qname in session.dns_records.values_list('src_ip', 'query_name'):
+        queries[(src_ip, psl.registered_domain(qname))][qname.lower()] += 1
+
+    for (src_ip, parent), counts in queries.items():
+        if len(counts) <= uniq_thresh:
+            continue
+        loose = sorted(n for n in counts if not connection_evidence or is_loose(src_ip, n))
+        if len(loose) <= uniq_thresh:
+            continue
+        total = sum(counts.values())
+        once = sum(1 for n in loose if counts[n] == 1)
+        findings.append(Detection(
+            session=session, flow=None,
+            rule_id='DNS_TUNNEL_SUBDOMAIN_VOLUME',
+            title=f'{len(loose)} unused subdomains of {parent} from {src_ip}',
+            category='exfiltration',
+            severity=Detection.Severity.MEDIUM,
+            method=Detection.Method.RULE,
+            confidence=min(len(loose) / (uniq_thresh * _t('confidence_scale_multiplier')), 1.0),
+            subject_ip=src_ip,
+            rationale=(
+                f'{src_ip} resolved {len(counts)} distinct names under {parent} in this '
+                f'capture and never connected to what {len(loose)} of them returned; '
+                f'{once} of those were asked for exactly once. Tunnelling clients '
+                f'generate a fresh name per chunk of data and have no use for the answer '
+                f'as an address, so one-off names nobody connects to, in volume, under '
+                f'one registered domain, is the shape of a tunnel. Threshold '
+                f'{uniq_thresh}. DNS-based reputation and blocklist lookups also look '
+                f'like this and must be ruled out. {method_note}'
+            ),
+            evidence={
+                'observed_unused_subdomains': len(loose),
+                'observed_unique_subdomains': len(counts),
+                'unused_names_queried_once': once,
+                'total_queries': total,
+                'unique_to_total_ratio': round(len(counts) / total, 3),
+                'connection_evidence_available': connection_evidence,
+                'registered_domain': parent,
+                'public_suffix_list': psl.version(),
+                'sample': loose[:EVIDENCE_SAMPLE_LIMIT],
+                'samples_are_illustrative': (
+                    f'showing {min(len(loose), EVIDENCE_SAMPLE_LIMIT)} of {len(loose)} '
+                    f'unused subdomains; the full set is in this session\'s DNS records'
+                ),
+                'method': SRC_ELASTIC_DNS,
+                **_cite('dns_unique_subdomains'),
+            },
+        ))
+    return findings
+
+
+def rule_port_scan(session):
+    """
+    Port scanning, using ncsa/bro-simple-scan's thresholds with one deliberate
+    departure from its aggregation.
+
+    Taken from that tool, verified against its source:
+
+    * `scan_threshold = 25` unique **host+port combinations** — so probing one
+      port across many hosts counts, which a per-destination port count misses.
+    * `local_scan_threshold = 250`. A host inside HOME_NET gets a far higher
+      bar: internal backup agents, monitoring boxes and the organisation's own
+      vulnerability scanners legitimately touch many ports.
+    * `scan_timeout = 15min`, which its comment defines as an inactivity
+      timeout — "tracked until not seen for this interval" — not a rolling
+      window. An earlier version of this rule cited it as a window and
+      implemented neither.
+
+    **Where we depart, and why.** bro-simple-scan is a streaming detector: it
+    can only hold state for so long, so probing that resumes after the timeout
+    starts a fresh count and a slow sweep never trips it. Its own comment
+    concedes this ("A higher interval will detect slower scanners"). Applying
+    that model to a stored capture measured what the tool would have alerted on
+    in real time, not what is in the evidence: on a week of real traffic it
+    reported 100 episodes from 16 sources, having discarded 291 other hosts
+    that scanned the same server slowly.
+    
+    Slow-and-low is precisely what a careful attacker does, and a forensic tool
+    holds the whole capture, so the count here is cumulative per source. The
+    timeout is still applied — to describe the shape of the activity, and to
+    report the largest single burst — but it no longer decides what is seen.
+    """
+    home = session_home_networks(session)
+    findings = []
+    remote_thresh = _t('scan_unique_ports')
+    local_thresh = _t('scan_unique_ports_local')
+    timeout = _t('scan_inactivity_timeout')
+
+    per_source = defaultdict(list)
+    for flow in session.flows.filter(protocol='TCP').order_by('first_seen'):
+        initiator, peer, service_port = flow_direction(flow)
+        if initiator:
+            per_source[initiator].append((flow.first_seen, peer, service_port, flow))
+
+    for source, probes in per_source.items():
+        # Only connections that *failed* count towards the threshold.
+        #
+        # This rule used to count every distinct host+port pair a source
+        # touched. Measured on 16 captures of ordinary traffic (research/157)
+        # it reported "10.0.2.15 probed 806 host+port combinations on 719
+        # hosts" — a browser loading pages, reaching CDNs and ad networks. A
+        # busy browser touches hundreds of hosts; that is what browsing is.
+        #
+        # Zeek counts failures and says so: Scan::addr_scan_threshold is "the
+        # threshold of the unique number of hosts a scanning host has to have
+        # **failed connections** with on a single port". The distinction is
+        # not a refinement, it is the whole signal — Jung et al. (IEEE S&P
+        # 2004, "Fast Portscan Detection Using Sequential Hypothesis Testing")
+        # built their detector on it and named the failure mode of counting
+        # destinations instead: such a rule "can erroneously flag a legitimate
+        # access such as that of Web crawlers or proxies".
+        #
+        # A failure here is a flow whose peer never completed a handshake:
+        # fewer than two packets back covers both of Zeek's cases — S0,
+        # "connection attempt seen, no reply", and REJ, a single RST. A
+        # connection that carried anything at all returns more than that. It
+        # is the same test the covert-channel rule already uses, for the same
+        # reason (research/155 s.3.2).
+        failed = [entry for entry in probes if entry[3].packets_received < 2]
+        combos = {(peer, port) for _, peer, port, _ in failed}
+        attempted = {(peer, port) for _, peer, port, _ in probes}
+        threshold = local_thresh if is_internal(source, home) else remote_thresh
+        if len(combos) < threshold:
+            continue
+        probes = failed
+
+        # Episode structure: how concentrated was the probing?
+        episodes = []
+        current = []
+        previous = None
+        for entry in probes:
+            if previous is not None and (entry[0] - previous).total_seconds() > timeout:
+                episodes.append(current)
+                current = []
+            current.append(entry)
+            previous = entry[0]
+        if current:
+            episodes.append(current)
+
+        largest = max(
+            (len({(peer, port) for _, peer, port, _ in ep}) for ep in episodes),
+            default=0,
+        )
+        targets = {peer for _, peer, _, _ in probes}
+        syn_only = sum(
+            1 for _, _, _, f in probes
+            if 'S' in (f.tcp_flags_seen or '') and 'A' not in (f.tcp_flags_seen or '')
+        )
+        syn_ratio = syn_only / len(probes) if probes else 0
+        span = (probes[-1][0] - probes[0][0]).total_seconds()
+        target_label = next(iter(targets)) if len(targets) == 1 else f'{len(targets)} hosts'
+        slow = len(episodes) > 1 and largest < threshold
+
+        findings.append(Detection(
+            session=session, flow=probes[0][3],
+            rule_id='RECON_PORT_SCAN',
+            title=f'Port scan: {source} failed to connect to {len(combos)} host+port '
+                  f'combinations on {target_label}',
+            category='reconnaissance',
+            severity=(Detection.Severity.HIGH
+                      if syn_ratio > _t('scan_syn_ratio_high')
+                      else Detection.Severity.MEDIUM),
+            method=Detection.Method.RULE,
+            confidence=min(len(combos) / (threshold * _t('confidence_scale_multiplier')), 1.0),
+            subject_ip=source,
+            rationale=(
+                f'{source} made failed connection attempts to {len(combos)} distinct '
+                f'host+port combinations across {len(targets)} host(s) over {span:.0f}s, in '
+                f'{len(episodes)} episode(s) '
+                f'separated by gaps of more than {timeout:.0f}s. The largest single episode '
+                f'reached {largest} combinations. {syn_only} of {len(probes)} connections '
+                f'were SYN without a completed handshake ({syn_ratio:.0%}), the half-open '
+                f'scan signature. Threshold {threshold} combinations, applied because this '
+                f'source is {"inside" if is_internal(source, home) else "outside"} the monitored '
+                f'network.'
+                + (' No single episode reached the threshold on its own — this is slow '
+                   'probing spread across the capture, which a streaming detector holding '
+                   f'state for only {timeout:.0f}s would not have reported.' if slow else '')
+                + ' Vulnerability scanners and monitoring systems produce identical traffic '
+                  'and should be whitelisted.'
+            ),
+            evidence={
+                'failed_host_port_combinations': len(combos),
+                'attempted_host_port_combinations': len(attempted),
+                'observed_target_hosts': len(targets),
+                'episode_count': len(episodes),
+                'largest_episode_combinations': largest,
+                'spread_below_streaming_threshold': slow,
+                'total_span_seconds': round(span, 1),
+                'syn_only_connections': syn_only,
+                'total_connections': len(probes),
+                'source_is_internal': is_internal(source, home),
+                'threshold_applied': threshold,
+                'aggregation': 'cumulative across the capture, not per episode — see the '
+                               'rule docstring for why this departs from bro-simple-scan',
+                'home_net': describe_home_net(session),
+                'home_net_source': SRC_HOME_NET,
+                **_cite('scan_unique_ports' if not is_internal(source, home)
+                        else 'scan_unique_ports_local'),
+                'inactivity_timeout': _cite('scan_inactivity_timeout'),
+            },
+        ))
+    return findings
+
+
+def rule_exfiltration(session):
+    findings = []
+    entropy_high = _t('exfil_entropy_high')
+    ratio_thresh = _t('exfil_ratio')
+    floor = _t('exfil_absolute_floor')
+    pct = _t('exfil_volume_percentile')
+
+    outbound = sorted(
+        v for v in session.flows.values_list('bytes_sent', flat=True) if v > 0
+    )
+    if not outbound:
+        return findings
+
+    idx = min(int(len(outbound) * pct / 100), len(outbound) - 1)
+    volume_threshold = max(outbound[idx], floor)
+
+    for flow in session.flows.all():
+        # Multicast, broadcast and link-local destinations first: the ratio
+        # this rule is built on is undefined for them. See LINK_SCOPED_NETWORKS.
+        _initiator, peer, _service = flow_direction(flow)
+        if is_link_scoped(peer) or is_link_scoped(flow.dst_ip):
+            continue
+
+        total_out = flow.bytes_sent
+        total_in = flow.bytes_received or 1
+        ratio = total_out / total_in
+
+        if total_out < volume_threshold or ratio < ratio_thresh:
+            continue
+
+        peer = flow.dst_ip if flow.initiator_ip == flow.src_ip else flow.src_ip
+        high_entropy = flow.payload_entropy >= entropy_high
+        # TLS is encrypted by design, so entropy alone means nothing there.
+        # Saying so on the record is what keeps this defensible.
+        tls_caveat = flow.app_protocol in ('TLS', 'HTTPS') or flow.dst_port == 443
+
+        findings.append(Detection(
+            session=session, flow=flow,
+            rule_id='EXFIL_VOLUME_ASYMMETRY',
+            title=f'{total_out / 1_048_576:.1f} MB outbound to {peer} ({ratio:.0f}:1)',
+            category='exfiltration',
+            # Three tiers, because the two signals are independent and the
+            # weakest combination is genuinely weak: a bulk upload over HTTPS
+            # whose payload entropy is unremarkable is what a backup, a video
+            # upload or a cloud sync looks like. Reporting that at the same
+            # level as an encrypted upload to a non-standard port would train
+            # an officer to ignore the rule.
+            severity=(
+                Detection.Severity.HIGH if high_entropy and not tls_caveat
+                else Detection.Severity.LOW if tls_caveat and not high_entropy
+                else Detection.Severity.MEDIUM
+            ),
+            method=Detection.Method.RULE,
+            confidence=min(ratio / (ratio_thresh * _t('confidence_scale_multiplier')), 1.0),
+            subject_ip=flow.initiator_ip,
+            rationale=(
+                f'{flow.initiator_ip} sent {total_out:,} bytes to {peer}:{flow.dst_port} '
+                f'while receiving only {flow.bytes_received:,} — a {ratio:.0f}:1 outbound '
+                f'asymmetry. Mean payload entropy {flow.payload_entropy:.2f} bits/byte '
+                f'({"above" if high_entropy else "below"} the {entropy_high} threshold at '
+                f'which content is indistinguishable from encrypted or compressed data). '
+                + ('NOTE: this flow is TLS, where high entropy is expected and is NOT by '
+                   'itself evidence of anything. The asymmetry, not the entropy, is the signal here.'
+                   if tls_caveat else '')
+            ),
+            evidence={
+                'observed_bytes_sent': total_out,
+                'observed_bytes_received': flow.bytes_received,
+                'observed_ratio': round(ratio, 2),
+                'observed_entropy': flow.payload_entropy,
+                'entropy_measured_over': (
+                    f'{flow.entropy_sample_count} sample(s) of up to '
+                    f'{ENTROPY_SAMPLE_BYTES} bytes — see entropy_max_samples'
+                ),
+                'volume_threshold_applied': volume_threshold,
+                'volume_threshold_basis': f'p{pct} of outbound volume in this capture, '
+                                          f'floored at {floor} bytes',
+                'entropy_threshold': _cite('exfil_entropy_high'),
+                'ratio_threshold': _cite('exfil_ratio'),
+                'is_tls': tls_caveat,
+            },
+        ))
+    return findings
+
+
+def rule_icmp_tunnel(session):
+    findings = []
+    size_thresh = _t('icmp_packet_bytes')
+
+    for flow in session.flows.filter(protocol='ICMP'):
+        if flow.avg_packet_size < size_thresh:
+            continue
+
+        # dst_port carries type*256 + code (see processor._classify). Only echo
+        # request (8) and echo reply (0) are candidates: every ICMP tunnel in
+        # the wild — ptunnel, icmpsh, icmptunnel — rides echo. ICMP *error*
+        # messages quote the offending packet's header and 8 bytes of payload
+        # (RFC 792), so a busy server answering scans emits hundreds of large
+        # unreachables that are not tunnels. On a real week-long server capture
+        # this distinction alone removed 338 of 799 findings; the minimum
+        # packet count below removed a further 238, and the two together took
+        # the rule from 799 to 25. See research/96.
+        icmp_type = (flow.dst_port or 0) >> 8
+        if icmp_type not in (0, 8):
+            continue
+
+        total_packets = (flow.packets_sent or 0) + (flow.packets_received or 0)
+        if total_packets < _t('icmp_min_packets'):
+            continue
+
+        peer = flow.dst_ip if flow.initiator_ip == flow.src_ip else flow.src_ip
+        findings.append(Detection(
+            session=session, flow=flow,
+            rule_id='ICMP_TUNNEL_OVERSIZED',
+            title=f'Oversized ICMP to {peer} (avg {flow.avg_packet_size:.0f} B)',
+            category='covert_channel',
+            severity=Detection.Severity.HIGH,
+            method=Detection.Method.RULE,
+            confidence=min(flow.avg_packet_size / (size_thresh * _t('confidence_scale_multiplier')), 1.0),
+            subject_ip=flow.initiator_ip,
+            rationale=(
+                f'{flow.initiator_ip} sent {flow.packets_sent} ICMP packets to {peer} '
+                f'averaging {flow.avg_packet_size:.0f} bytes per packet (payload entropy '
+                f'{flow.payload_entropy:.2f}). Standard ping sends 56 bytes of payload on '
+                f'Linux and 32 on Windows — 84 and 60 bytes on the wire once headers are '
+                f'counted. Sustained packets above {size_thresh} bytes carry more than a '
+                f'ping needs, which is what a tunnel through echo requests looks like.'
+            ),
+            evidence={
+                'observed_avg_packet_size': flow.avg_packet_size,
+                'measured_on': 'whole frame including IP and ICMP headers',
+                'observed_entropy': flow.payload_entropy,
+                'entropy_measured_over': (
+                    f'{flow.entropy_sample_count} sample(s) of up to '
+                    f'{ENTROPY_SAMPLE_BYTES} bytes — see entropy_max_samples'
+                ),
+                'packet_count': flow.packets_sent,
+                'icmp_type': icmp_type,
+                'icmp_type_name': 'echo request' if icmp_type == 8 else 'echo reply',
+                'total_packets': total_packets,
+                **{'min_packets_' + k: v for k, v in _cite('icmp_min_packets').items()},
+                'error_types_excluded': 'ICMP error messages quote the original packet '
+                                        'header (RFC 792) and are large by design',
+                'baseline': SRC_PING,
+                **_cite('icmp_packet_bytes'),
+            },
+        ))
+    return findings
+
+
+
+def rule_ioc_feed_match(session):
+    """
+    A conversation with something a loaded threat-intelligence feed names.
+
+    This is the only rule in the engine whose evidence is somebody else's.
+    Everything about how it reports is shaped by that:
+
+    **It never exceeds HIGH.** Our other rules cite a measured value against a
+    published threshold and can reach CRITICAL. This cites a list. Borrowed
+    evidence must not outrank measured evidence, so a feed hit is HIGH at most
+    and MEDIUM when the feed is materially newer than the traffic.
+
+    **It states the feed's distance from the traffic.** Addresses get
+    reassigned; a list compiled two years after a capture may name an address
+    that belonged to somebody else when the packets were sent. A match on a
+    feed published *before* the traffic is a much stronger fact than a match on
+    one published long after, and the finding says which it is rather than
+    presenting both as "known malicious".
+
+    **It quotes the line.** The evidence carries the feed name, the file's
+    SHA-256, the date the officer stated they obtained it, and the row itself,
+    so "where does this claim come from" is answerable without leaving the
+    finding.
+
+    Silent when no feed is loaded, which is the normal state of an air-gapped
+    workstation nobody has carried a feed to.
+    """
+    from .ioc import match_session
+
+    # One finding per claim, not per packet capture of it.
+    #
+    # A host beaconing to a listed address every forty-five seconds produces
+    # hundreds of flows and hundreds of raw matches, all asserting the same
+    # thing: this machine talked to that address, which is on this list. Emitted
+    # one-per-flow they would bury every other finding in the queue, and the
+    # triage count would measure how chatty the malware was rather than how much
+    # there is to review. The earliest occurrence is kept as the exemplar and
+    # the rest are counted.
+    grouped = {}
+    for hit in match_session(session):
+        key = (hit['subject_ip'], hit['indicator'].id, hit['where'])
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = {**hit, 'occurrences': 1}
+            continue
+        existing['occurrences'] += 1
+        earlier = hit['seen_at'] is not None and (
+            existing['seen_at'] is None or hit['seen_at'] < existing['seen_at'])
+        if earlier:
+            existing['seen_at'] = hit['seen_at']
+            existing['flow'] = hit['flow']
+            existing['staleness_days'] = hit['staleness_days']
+
+    findings = []
+    for hit in sorted(grouped.values(),
+                      key=lambda h: (h['subject_ip'] or '', h['observed'])):
+        indicator = hit['indicator']
+        feed = hit['feed']
+        stale = hit['staleness_days']
+
+        # Newer than the traffic by more than a quarter is the case where
+        # reassignment is a live possibility, so the finding steps down.
+        far_ahead = stale is not None and stale > 90
+        severity = (Detection.Severity.MEDIUM if far_ahead
+                    else Detection.Severity.HIGH)
+
+        if stale is None:
+            timing = ('The capture carries no timestamp for this observation, '
+                      'so the feed cannot be dated against it.')
+        elif stale < 0:
+            timing = (
+                f'The feed already listed this {abs(stale):.0f} day(s) before '
+                f'the traffic was recorded, so the listing is not explained by '
+                f'a later reassignment of the address.'
+            )
+        else:
+            timing = (
+                f'The feed was compiled {stale:.0f} day(s) after this traffic. '
+                f'Addresses are reassigned, so a gap this size is a reason to '
+                f'confirm the listing covered the period of the capture.'
+            )
+
+        findings.append(Detection(
+            session=session, flow=hit['flow'],
+            rule_id='IOC_FEED_MATCH',
+            title=(
+                f"{hit['subject_ip']} contacted {hit['observed']}, listed by "
+                f"{feed.name}"
+            ),
+            category='threat_intel',
+            severity=severity,
+            method=Detection.Method.RULE,
+            # Not a computed score. A feed either lists something or it does
+            # not, so confidence here would be a decoration.
+            confidence=1.0,
+            subject_ip=hit['subject_ip'],
+            rationale=(
+                f"{hit['subject_ip']} was recorded in "
+                f"{hit['occurrences']} conversation"
+                f"{'s' if hit['occurrences'] != 1 else ''} whose "
+                f"{hit['where']} was {hit['observed']}, which appears in "
+                f"{feed.name}"
+                + (f" ({indicator.context})" if indicator.context else '')
+                + f'. This is an assertion by a third party, not a measurement '
+                  f'made by this tool. {timing}'
+            ),
+            evidence={
+                'indicator': indicator.value,
+                'indicator_kind': indicator.kind,
+                'observed_as': hit['where'],
+                'observed_value': hit['observed'],
+                'conversations_matching': hit['occurrences'],
+                'earliest_seen': (
+                    hit['seen_at'].isoformat() if hit['seen_at'] else None),
+                'feed_name': feed.name,
+                'feed_source_stated_by_importer': feed.source,
+                'feed_file_sha256': feed.file_sha256,
+                'feed_retrieved_on': feed.retrieved_on.isoformat(),
+                'feed_published_on': (
+                    feed.published_on.isoformat() if feed.published_on else None),
+                'feed_entry_count': feed.entry_count,
+                'feed_licence': feed.licence,
+                'listed_on': (
+                    indicator.listed_on.isoformat() if indicator.listed_on else None),
+                'feed_line': indicator.source_line,
+                'feed_days_after_traffic': stale,
+                'evidence_class': 'third-party assertion, not measured here',
+                'severity_cap': (
+                    'Capped at HIGH. A feed match is borrowed evidence and must '
+                    'not outrank a rule citing a measured value against a '
+                    'published threshold.'
+                ),
+            },
+        ))
+    return findings
+
+
+# Every rule_id the engine can emit, declared rather than counted by hand.
+#
+# The landing page states how many rules there are, and three separate strings
+# used to carry that number as prose. A test pins this list to what the source
+# actually emits, and the public /api/engine/ endpoint serves it, so the claim
+# on screen cannot drift from the code.
+#
+# Note this is longer than RULES: rule_beaconing emits two ids, and
+# HOST_CORROBORATED comes from the post-pass rather than from a rule function.
+# The unsupervised signal's id, imported at module scope rather than inside the
+# function: it belongs to the engine's published vocabulary, and RuleRegistryTests
+# resolves `rule_id=NAME` against this module to confirm RULE_IDS is complete.
+from .anomaly import RULE_ID as ANOMALY_RULE_ID
+
+
+def statistical_anomalies(session):
+    """
+    Turn the unsupervised model's outliers into findings.
+
+    Kept out of RULES because it is not a rule: it cites no threshold and
+    proves nothing on its own. It is capped at MEDIUM and always carries the
+    features that made the flow stand out, so an officer reading it can see
+    the reasoning rather than a bare score.
+
+    See capture/anomaly.py for why the model is fitted per capture and what
+    that cannot do.
+    """
+    from .anomaly import score_session
+
+    results, explanation = score_session(session)
+    findings = []
+
+    for result in results:
+        flow = result['flow']
+        reasons = result['reasons']
+        top = reasons[0]
+
+        # The title is the plain-language claim. It names the strongest reason
+        # rather than the score, because "unusually high payload randomness"
+        # is something an officer can act on and "-0.68" is not.
+        summary = ', '.join(
+            f"{r['feature']} {r['direction']}" for r in reasons[:3]
+        )
+
+        # The other end of the conversation, not simply dst_ip: when the flow
+        # was initiated from what the capture records as the destination, both
+        # fields hold the same address and the title read "X → X".
+        peer = flow.dst_ip if flow.initiator_ip == flow.src_ip else flow.src_ip
+
+        findings.append(Detection(
+            session=session,
+            flow=flow,
+            rule_id=ANOMALY_RULE_ID,
+            title=(
+                f'{flow.initiator_ip} → {peer}: {top["feature"]} '
+                f'{top["direction"]} for this capture'
+            ),
+            category='anomaly',
+            severity=Detection.Severity.MEDIUM,
+            method=Detection.Method.MODEL,
+            # Reported, not asserted. The isolation score is bounded roughly
+            # in [-1, 0]; mapping it to a 0-1 confidence would invent a
+            # precision the method does not have, so the raw score is carried
+            # in evidence and confidence stays at the floor for a signal that
+            # is a lead rather than a conclusion.
+            confidence=0.5,
+            subject_ip=flow.initiator_ip,
+            rationale=(
+                f'This conversation was isolated as unusual against the other '
+                f'flows in this same capture: {summary}. '
+                f'This is a statistical signal, not a rule — no threshold was '
+                f'compared and nothing is proven by it. It marks traffic worth '
+                f'an officer looking at, and it is capped at MEDIUM for that '
+                f'reason. {explanation}'
+            ),
+            evidence={
+                'method': 'IsolationForest, fitted on this capture only',
+                'isolation_score': result['score'],
+                'unusual_features': reasons,
+                'model_note': explanation,
+                # Stated on every finding because it is the honest limit of
+                # the technique and an officer should not have to know it.
+                'limitation': (
+                    'Learns what is ordinary in this capture. If the whole '
+                    'capture is malicious, nothing in it will look unusual.'
+                ),
+            },
+        ))
+
+    return findings
+
+
+RULE_IDS = (
+    'C2_BEACON_KEEPALIVE',
+    'C2_BEACON_PERIODIC',
+    'COVERT_CHANNEL_UNKNOWN_PORT',
+    'DNS_TUNNEL_LONG_LABEL',
+    'DNS_TUNNEL_SUBDOMAIN_VOLUME',
+    'EXFIL_VOLUME_ASYMMETRY',
+    'HOST_CORROBORATED',
+    'ICMP_TUNNEL_OVERSIZED',
+    # Fires only where a threat-intelligence feed has been imported. The rule
+    # is always present; on a workstation nobody has carried a feed to it emits
+    # nothing, which is correct rather than a misconfiguration.
+    'IOC_FEED_MATCH',
+    'RECON_PORT_SCAN',
+    # Not a rule — the unsupervised signal. Listed here so the published rule
+    # inventory matches what the engine can actually emit.
+    'ANOMALY_STATISTICAL',
+)
+
+
+RULES = [
+    rule_beaconing,
+    rule_beaconing_keepalive,
+    rule_unknown_long_channel,
+    rule_dns_tunnelling,
+    rule_port_scan,
+    rule_exfiltration,
+    rule_icmp_tunnel,
+    # Last, and silent unless somebody has carried a feed to this machine.
+    rule_ioc_feed_match,
+]
+
+# Single source of truth, shared with Detection.Meta ordering. Published in
+# THRESHOLDS so the 0-100 risk_score shown on the dashboard is not an
+# unexplained number.
+SEVERITY_WEIGHT = {
+    Detection.Severity.LOW: _t('risk_score_low'),
+    Detection.Severity.MEDIUM: _t('risk_score_medium'),
+    Detection.Severity.HIGH: _t('risk_score_high'),
+    Detection.Severity.CRITICAL: _t('risk_score_critical'),
+}
+
+
+def synthesise_corroboration(session, findings):
+    """
+    Summarise hosts that several independent rules have implicated.
+
+    This is not another detector. It introduces no observation of its own and
+    can only restate what the rules already found — which is exactly why it is
+    the one thing in the engine allowed to say CRITICAL. A single rule firing
+    is a prompt to look; the same address turning up under three unrelated
+    rules is the shape of an actual incident, and an officer working a list of
+    three hundred findings should not have to spot that by eye.
+
+    Run after the rules rather than beside them, because its input is their
+    output. It is deliberately not in RULES: everything there takes a session
+    and reads packets.
+    """
+    minimum = _t('corroboration_distinct_rules')
+
+    # Only rules measured silent on ordinary traffic may vote (base_rates.py).
+    # Counting every rule made this fire on 7 of 16 captures of a Windows VM
+    # browsing the web and on none of 7 attacks (research/157): agreement
+    # among rules that each fire on innocent traffic is not evidence, and this
+    # is the one finding that says CRITICAL.
+    by_subject = defaultdict(list)
+    for finding in findings:
+        if finding.subject_ip and base_rates.may_corroborate(finding.rule_id):
+            by_subject[finding.subject_ip].append(finding)
+
+    summaries = []
+    for subject, related in sorted(by_subject.items()):
+        rules = sorted({f.rule_id for f in related})
+        if len(rules) < minimum:
+            continue
+
+        categories = sorted({f.category for f in related if f.category})
+        worst = max(related, key=lambda f: SEVERITY_WEIGHT.get(f.severity, 0))
+
+        summaries.append(Detection(
+            session=session, flow=None,
+            rule_id='HOST_CORROBORATED',
+            title=f'{subject} implicated by {len(rules)} independent rules',
+            category='correlation',
+            severity=Detection.Severity.CRITICAL,
+            method=Detection.Method.RULE,
+            # Confidence rises with corroboration but is capped: this restates
+            # other findings, so it cannot be more certain than they are.
+            confidence=min(len(rules) / (minimum * 2), 1.0),
+            subject_ip=subject,
+            rationale=(
+                f'{subject} appears in {len(related)} finding(s) produced by '
+                f'{len(rules)} different rules: {", ".join(rules)}. '
+                f'The strongest single finding against it is "{worst.title}". '
+                f'No new measurement was taken — this finding exists because '
+                f'unrelated tests keep returning the same address, which one '
+                f'finding at a time is easy to miss in a long list. '
+                f'Read the contributing findings before acting on it.'
+            ),
+            evidence={
+                'contributing_rules': rules,
+                'contributing_findings': [
+                    {'rule_id': f.rule_id, 'severity': f.severity, 'title': f.title}
+                    for f in sorted(related, key=lambda f: f.rule_id)
+                ],
+                'categories': categories,
+                'distinct_rule_count': len(rules),
+                **_cite('corroboration_distinct_rules'),
+            },
+        ))
+    return summaries
+
+
+def analyse_session(session, clear_existing=True, dispatch_alerts=True):
+    """
+    Run every rule over a completed capture and persist the findings.
+
+    **Rules run outside the write transaction.** They read flows and DNS
+    records and write nothing, and on a 223,000-flow capture they take about
+    43 seconds. This function used to be wrapped whole in `transaction.atomic`,
+    and Django is configured to BEGIN IMMEDIATE, so those 43 seconds were
+    43 seconds holding SQLite's single write lock while doing no writing —
+    long enough for an officer's sign-in to wait out its 30-second timeout and
+    fail (research/155 s.4.1). The findings are still written all-or-nothing:
+    the transaction now opens after the last rule has run and covers exactly
+    the writes.
+
+    **Triage decisions survive re-analysis.** Re-running used to delete every
+    rule-generated row and recreate it as NEW — which discarded triage_status,
+    reviewed_by, reviewed_at and review_note for the whole session. The
+    docstring called that a safeguard against duplication; what it actually did
+    was erase the investigators' record from a one-click button.
+
+    A finding is now matched to its predecessor on (rule_id, subject_ip,
+    title), and any decision recorded against that predecessor is carried
+    forward. Those three together identify the same claim about the same host:
+    the rule that made it, who it is about, and what it said. If a rule's
+    thresholds change enough to alter the title, the finding is genuinely a
+    different assertion and correctly arrives unreviewed.
+    """
+    findings = []
+    for rule in RULES:
+        findings.extend(rule(session))
+
+    # Runs on the rules' output, so it comes after them and not in RULES.
+    findings.extend(synthesise_corroboration(session, findings))
+
+    # The unsupervised signal, last: it is a lead rather than a conclusion and
+    # is capped at MEDIUM, so it never outranks a rule that cited a threshold.
+    findings.extend(statistical_anomalies(session))
+
+    # Every finding carries what its rule has been measured to do on ordinary
+    # traffic, and a rule never shown to fire on an attack is capped at LOW.
+    for finding in findings:
+        base_rates.annotate(finding)
+
+    # bulk_create bypasses Model.save(), so the rank must be set here or
+    # every finding sorts as 0.
+    for finding in findings:
+        finding.severity_rank = SEVERITY_WEIGHT.get(finding.severity, 0)
+
+    restored, carried_count, per_flow = _write_findings(
+        session, findings, clear_existing)
+
+    by_severity = defaultdict(int)
+    by_rule = defaultdict(int)
+    for finding in findings:
+        by_severity[finding.severity] += 1
+        by_rule[finding.rule_id] += 1
+
+    # Push to whatever is listening, once the findings are on disk. After the
+    # write, so an alert never describes a finding that failed to persist; and
+    # after bulk_create rather than inside it, because a SIEM that is down must
+    # not roll back an analysis. Returns [] when no sink is configured, which
+    # is the default and is not an error.
+    # Live monitoring calls this every window and does its own dispatching, so
+    # that it can alert on findings that are new *since the last window* rather
+    # than re-announcing the same beacon every thirty seconds until someone
+    # mutes the channel.
+    from .alerting import dispatch
+
+    deliveries = (
+        [result.as_dict() for result in dispatch(findings, session=session)]
+        if dispatch_alerts else []
+    )
+
+    return {
+        'total': len(findings),
+        'triage_decisions_carried_forward': restored,
+        'triage_decisions_lost': max(carried_count - restored, 0),
+        'by_severity': dict(by_severity),
+        'by_rule': dict(by_rule),
+        'flows_flagged': len(per_flow),
+        # Reported to the caller so a failed push is visible where the analysis
+        # is read, rather than only in a log nobody opens.
+        'alerts': deliveries,
+    }
+
+
+@transaction.atomic
+def _write_findings(session, findings, clear_existing):
+    """
+    The only part of an analysis that writes, in one transaction.
+
+    Kept deliberately short. SQLite has one writer, Django opens transactions
+    with BEGIN IMMEDIATE, and everything else that writes — a sign-in, a
+    triage decision, an audit entry — waits behind whatever is open. The rules
+    that produced `findings` took about 43 seconds on a large capture and
+    wrote nothing; they now run before this is called.
+
+    Returns (restored, carried_count, per_flow).
+    """
+    carried = {}
+    if clear_existing:
+        # Both methods are cleared, not just the rules: leaving the model's
+        # previous findings behind would accumulate a duplicate set on every
+        # re-run, and their triage decisions are carried forward the same way.
+        #
+        # Read inside this transaction rather than before the rules ran, so a
+        # decision recorded by an investigator while the rules were running is
+        # carried forward rather than deleted.
+        previous = session.detections.all()
+        for old_finding in previous:
+            if old_finding.triage_status != Detection.Triage.NEW:
+                carried[(old_finding.rule_id, old_finding.subject_ip, old_finding.title)] = {
+                    'triage_status': old_finding.triage_status,
+                    'reviewed_by_id': old_finding.reviewed_by_id,
+                    'reviewed_at': old_finding.reviewed_at,
+                    'review_note': old_finding.review_note,
+                }
+        previous.delete()
+
+    # Restore analyst decisions before the rows are written.
+    restored = 0
+    for finding in findings:
+        prior = carried.get((finding.rule_id, finding.subject_ip, finding.title))
+        if prior:
+            for field, value in prior.items():
+                setattr(finding, field, value)
+            restored += 1
+
+    Detection.objects.bulk_create(findings, batch_size=500)
+
+    # Roll findings up onto their flows so tables can sort by risk.
+    per_flow = defaultdict(int)
+    for finding in findings:
+        if finding.flow_id:
+            per_flow[finding.flow_id] = max(
+                per_flow[finding.flow_id], SEVERITY_WEIGHT[finding.severity],
+            )
+
+    # Reset every flow first, then raise the flagged ones.
+    #
+    # This used to reset only flows not yet analysed, so on a *re*-analysis a
+    # flow flagged by an earlier run kept its old risk score after the finding
+    # behind it was gone. Measured on a real Mirai capture after a rule fix:
+    # 3,820 flows still scored as risky with findings against 52 of them — the
+    # "Flagged flows" card, the timeline's flagged band and the graph's red
+    # edges all read this column, so all three kept showing findings that no
+    # longer existed.
+    #
+    # It also issued one UPDATE per flagged flow — 3,769 statements on that
+    # capture. Flows are grouped by score instead: at most one statement per
+    # severity weight, in chunks under SQLite's bound-parameter limit. The final
+    # state is the same as before for a first analysis.
+    session.flows.update(risk_score=0, is_analyzed=True)
+    by_score = defaultdict(list)
+    for flow_id, score in per_flow.items():
+        by_score[score].append(flow_id)
+    for score, flow_ids in by_score.items():
+        for start in range(0, len(flow_ids), 900):
+            Flow.objects.filter(pk__in=flow_ids[start:start + 900]).update(risk_score=score)
+
+    return restored, len(carried), per_flow
