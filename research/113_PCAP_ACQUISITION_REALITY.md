@@ -325,7 +325,7 @@ captured. They are different artefact classes from different custodians, full st
 | TLS SNI | **Yes, usually** | Plaintext hostname in ClientHello; narrows with Encrypted Client Hello adoption. |
 | HTTP Host headers / URLs | **Yes, only for cleartext HTTP** | Rare now; most traffic is HTTPS. |
 | JA4 TLS client fingerprint | **Yes — already implemented in this codebase** | `backend/capture/tls_fingerprint.py`. |
-| DHCP hostnames | **Yes** | Devices often broadcast a human-chosen name ("Anbus-iPhone") in the DHCP request — a real, well-known identity leak. |
+| DHCP hostnames | **Yes** | Devices often broadcast a human-chosen name ("Fuzails-iPhone") in the DHCP request — a real, well-known identity leak. |
 | mDNS/Bonjour device/service names | **Yes** | AirPlay/HomeKit/printer/NAS advertisements carry device names in cleartext multicast. |
 | User-Agent strings | **Only for cleartext HTTP** | Not visible over HTTPS without decryption. |
 | WhatsApp/Signal/Telegram content | **No** | End-to-end encrypted; only connection metadata and coarse activity-type inference from traffic patterns (§2.3) is possible, and that is a research technique, not a reliable operational one. |
@@ -469,7 +469,7 @@ evidentially-preferred source for anything that will end up in court.
    into the headline answer to "how does this work in an air-gapped room." Low-medium effort
    because the hard part (the capture pipeline itself) is done.
 3. **DHCP hostname / mDNS device-name extraction into flow records.** Real forensic value
-   (device attribution — "Anbus-iPhone" connected from this MAC at this time) and low
+   (device attribution — "Fuzails-iPhone" connected from this MAC at this time) and low
    incremental effort given the packet-parsing infrastructure (`home_net.py`, `features.py`,
    the JA4 parser as a working example of TLS-record-level extraction) already exists in the
    codebase to extend from.

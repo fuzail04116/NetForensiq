@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+# Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 """How much of 'persist' is Django, and how much is SQLite itself?"""
 import os, sys, time, sqlite3
-sys.path.insert(0, '/home/anbu/26_class/GujaratPolice_Hackathon/NetForensiq/backend')
+sys.path.insert(0, '/home/fuzail/26_class/GujaratPolice_Hackathon/NetForensiq/backend')
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'netforensiq_backend.settings')
 import django; django.setup()
 from capture import fastparse

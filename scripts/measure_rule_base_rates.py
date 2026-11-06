@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+# Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 """
 How often does each detection rule fire on traffic that is not an attack?
 
@@ -32,7 +32,7 @@ cannot see another's flows and the runs are independent.
 Usage::
 
     python scripts/measure_rule_base_rates.py \\
-        --captures /home/anbu/26_class/mal/benign_pcaps \\
+        --captures /home/fuzail/26_class/mal/benign_pcaps \\
         --label benign --out /tmp/base_rates_benign.json
 """
 

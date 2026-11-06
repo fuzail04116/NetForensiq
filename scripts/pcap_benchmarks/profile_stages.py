@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+# Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 """
 Decompose the current PCAP import into its stages and time each one.
 
@@ -9,7 +9,7 @@ below is a wall-clock measurement of this machine reading this file.
 """
 import os, sys, time, resource
 
-sys.path.insert(0, '/home/anbu/26_class/GujaratPolice_Hackathon/NetForensiq/backend')
+sys.path.insert(0, '/home/fuzail/26_class/GujaratPolice_Hackathon/NetForensiq/backend')
 
 PCAP = sys.argv[1]
 LIMIT = int(sys.argv[2]) if len(sys.argv) > 2 else 400_000

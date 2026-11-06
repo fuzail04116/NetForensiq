@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+# Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 """Seed indicators that DO match, then compare old vs new .only() row-for-row."""
 import os, sys, time
-sys.path.insert(0, '/home/anbu/26_class/GujaratPolice_Hackathon/NetForensiq/backend')
+sys.path.insert(0, '/home/fuzail/26_class/GujaratPolice_Hackathon/NetForensiq/backend')
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'netforensiq_backend.settings')
 import django; django.setup()
 from django.db import connection, reset_queries
@@ -44,7 +44,7 @@ def norm(hits):
 reset_queries(); t = time.perf_counter(); new = ioc.match_session(s); t_new = time.perf_counter()-t
 q_new = len(connection.queries)
 
-src = open('/home/anbu/26_class/GujaratPolice_Hackathon/NetForensiq/backend/capture/ioc.py').read()
+src = open('/home/fuzail/26_class/GujaratPolice_Hackathon/NetForensiq/backend/capture/ioc.py').read()
 old = (src.replace("'id', 'session_id', 'src_ip', 'dst_ip', 'initiator_ip', 'tls_sni',\n        'http_host', 'first_seen',",
                    "'id', 'src_ip', 'dst_ip', 'initiator_ip', 'tls_sni', 'http_host',\n        'first_seen',")
           .replace("'id', 'session_id', 'src_ip', 'query_name', 'timestamp'",

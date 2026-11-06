@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+// Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 // What the page needs from noble, and nothing else. Bundled by build.mjs into
 // vendor/noble.iife.js, which is committed so it can be read without building.
 import { sha256 } from '@noble/hashes/sha2.js';

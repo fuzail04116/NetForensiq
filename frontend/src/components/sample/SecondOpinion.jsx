@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+// Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 import { useRef, useState } from 'react';
 import { Box, Typography, Button, Alert } from '@mui/material';
 import { fileSecondOpinion } from '../../services/forensics';

@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+# Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 """How often do the two real divergences actually occur, across every capture?"""
 import os, sys, collections
-sys.path.insert(0, '/home/anbu/26_class/GujaratPolice_Hackathon/NetForensiq/backend')
+sys.path.insert(0, '/home/fuzail/26_class/GujaratPolice_Hackathon/NetForensiq/backend')
 from scapy.layers.dns import DNS
 from scapy.layers.inet import ICMP
 from capture import fastparse, fastdns
 
 CAPS = []
-for d in ('/home/anbu/26_class/GujaratPolice_Hackathon/NetForensiq/backend/reference_captures',
-          '/home/anbu/26_class/GujaratPolice_Hackathon/NetForensiq/backend/synthetic_captures',
-          '/home/anbu/26_class/GujaratPolice_Hackathon/NetForensiq/RealAttacksPCAP'):
+for d in ('/home/fuzail/26_class/GujaratPolice_Hackathon/NetForensiq/backend/reference_captures',
+          '/home/fuzail/26_class/GujaratPolice_Hackathon/NetForensiq/backend/synthetic_captures',
+          '/home/fuzail/26_class/GujaratPolice_Hackathon/NetForensiq/RealAttacksPCAP'):
     if os.path.isdir(d):
         CAPS += [os.path.join(d, f) for f in sorted(os.listdir(d))
                  if f.endswith(('.pcap', '.pcapng'))]

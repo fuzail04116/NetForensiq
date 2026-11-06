@@ -3,8 +3,8 @@
 **NetForensiq** — network forensics and Android malware examination for police
 cybercrime investigation.
 
-Copyright (c) 2026 Anbuchelvan Ganesan
-Source: <https://github.com/Anbu-00001/NetForensiq>
+Copyright (c) 2026 A Muhammed Fuzail
+Source: <https://github.com/fuzail04116/NetForensiq>
 Licence: MIT — see [LICENSE](LICENSE)
 
 Built for KANAD S.H.I.E.L.D. 2026, the Ahmedabad City Police cybercrime hackathon
@@ -31,8 +31,8 @@ ZIP download, a vendored copy, or a fork.
 ## If you present work built on this
 
 Fork it, extend it and submit the result anywhere — and say where it started. A
-line such as *"built on NetForensiq by Anbuchelvan Ganesan
-(github.com/Anbu-00001/NetForensiq)"* is enough.
+line such as *"built on NetForensiq by A Muhammed Fuzail
+(github.com/fuzail04116/NetForensiq)"* is enough.
 
 Presenting this code, or a derivative with the notices removed, as your own
 original work is not permitted by the licence, because the licence's only

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+# Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 """Where exactly does scapy cut the quoted packet? Vary the input and watch."""
 import sys
-sys.path.insert(0, '/home/anbu/26_class/GujaratPolice_Hackathon/NetForensiq/backend')
+sys.path.insert(0, '/home/fuzail/26_class/GujaratPolice_Hackathon/NetForensiq/backend')
 from scapy.layers.inet import IP, ICMP, TCP, UDP
 from scapy.packet import Raw
 

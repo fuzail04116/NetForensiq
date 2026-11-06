@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+# Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 """
 Keep a permanent record of who is reaching the repository — in aggregate.
 
@@ -30,7 +30,7 @@ Voluntary reports go through the deployment-report issue template instead.
 
 Usage (needs the GitHub CLI, authenticated as someone with write access):
     python scripts/archive_github_traffic.py
-    python scripts/archive_github_traffic.py --repo Anbu-00001/NetForensiq --out ~/nf-traffic
+    python scripts/archive_github_traffic.py --repo fuzail04116/NetForensiq --out ~/nf-traffic
 
 Run it at least once every 14 days — a weekly cron entry is the easy way — or
 the days in between are lost for good.
@@ -85,7 +85,7 @@ def merge_daily(archive, fetched, key):
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--repo', default='Anbu-00001/NetForensiq')
+    parser.add_argument('--repo', default='fuzail04116/NetForensiq')
     parser.add_argument('--out', default=os.path.expanduser('~/.netforensiq-traffic'),
                         help='archive directory (kept outside the repository by default)')
     args = parser.parse_args(argv)

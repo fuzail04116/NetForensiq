@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+// Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 // Loads the verifier core in Node, from the same bytes the page ships: the
 // committed noble bundle and src/verify-core.js. Used by the command-line tool
 // and by every test, so what is tested is what is shipped.

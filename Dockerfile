@@ -63,8 +63,8 @@ FROM python:3.12-slim AS runtime
 # its source lives, however it is re-tagged or mirrored. The values must match
 # backend/netforensiq_backend/provenance.py; capture/tests_provenance.py checks.
 LABEL org.opencontainers.image.title="NetForensiq" \
-      org.opencontainers.image.authors="Anbuchelvan Ganesan" \
-      org.opencontainers.image.source="https://github.com/Anbu-00001/NetForensiq" \
+      org.opencontainers.image.authors="A Muhammed Fuzail" \
+      org.opencontainers.image.source="https://github.com/fuzail04116/NetForensiq" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.description="Offline network forensics and Android malware examination for police cybercrime investigation"
 

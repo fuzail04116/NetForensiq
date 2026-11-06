@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+# Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 import sys
-sys.path.insert(0, '/home/anbu/26_class/GujaratPolice_Hackathon/NetForensiq/backend')
+sys.path.insert(0, '/home/fuzail/26_class/GujaratPolice_Hackathon/NetForensiq/backend')
 MODE = sys.argv[1]
 if MODE == 'all':
     from scapy.all import conf          # loads every layer, as capture.service does
 from scapy.layers.inet import ICMP
 from capture import fastparse
-P='/home/anbu/26_class/GujaratPolice_Hackathon/NetForensiq/backend/reference_captures/2024-12-18-one-week-of-server-scans-and-probes-and-web-traffic.pcap'
+P='/home/fuzail/26_class/GujaratPolice_Hackathon/NetForensiq/backend/reference_captures/2024-12-18-one-week-of-server-scans-and-probes-and-web-traffic.pcap'
 bad=tot=0; first=None
 for data,_ts,lt in fastparse.iter_frames(P):
     p = fastparse.parse(data, lt)

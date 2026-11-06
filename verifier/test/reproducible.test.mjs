@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+// Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 // "Check the checker": rebuilding from the committed sources with the pinned
 // dependencies must give exactly the committed page, so its published SHA-256 is
 // something a reader can reproduce rather than take on trust.

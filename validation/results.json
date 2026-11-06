@@ -189,8 +189,8 @@
    "note": "Held-out corpus: selected by exclusion from an existing manifest before any measurement, never by whether the engine detects the sample.",
    "selection": {
     "excluded_manifests": [
-     "/home/anbu/26_class/mal/malwarebazaar/corpus_manifest.json",
-     "/home/anbu/26_class/mal/malwarebazaar_heldout/corpus_manifest.json"
+     "/home/fuzail/26_class/mal/malwarebazaar/corpus_manifest.json",
+     "/home/fuzail/26_class/mal/malwarebazaar_heldout/corpus_manifest.json"
     ],
     "limit": 100,
     "listing": "blind_listing.json",
@@ -225,7 +225,7 @@
    "note": "Held-out corpus: selected by exclusion from an existing manifest before any measurement, never by whether the engine detects the sample.",
    "selection": {
     "excluded_manifests": [
-     "/home/anbu/26_class/mal/malwarebazaar/corpus_manifest.json"
+     "/home/fuzail/26_class/mal/malwarebazaar/corpus_manifest.json"
     ],
     "limit": 100,
     "listing": "mb_listing.json",

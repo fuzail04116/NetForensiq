@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+# Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 """
 Run MobSF over the same APKs NetForensiq's engine was scored on.
 
@@ -17,7 +17,7 @@ Talks to MobSF's REST API (upload -> scan -> report_json), which is what
 anyone automating it would use:
 https://mobsf.github.io/docs/#/rest_api
 
-    ./mobsf_compare.py --samples /home/anbu/26_class/mal/mobsf_samples \
+    ./mobsf_compare.py --samples /home/fuzail/26_class/mal/mobsf_samples \
                        --out mobsf/ --key "$MOBSF_API_KEY"
 """
 import argparse

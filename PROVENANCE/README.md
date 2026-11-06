@@ -1,6 +1,6 @@
 # Provenance
 
-Proof that NetForensiq, as written by Anbuchelvan Ganesan, existed at a given time —
+Proof that NetForensiq, as written by A Muhammed Fuzail, existed at a given time —
 checkable by anyone, without trusting this repository, GitHub, or its author.
 
 ## What is here

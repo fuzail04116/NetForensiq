@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+# Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 """
 Who made this, where it lives, and under what terms — stated once.
 
@@ -23,10 +23,10 @@ breaks the licence; it does not change who wrote the code. PROVENANCE/ holds a
 timestamped proof of what existed when, which is how that question is settled.
 """
 
-AUTHOR = 'Anbuchelvan Ganesan'
+AUTHOR = 'A Muhammed Fuzail'
 PROJECT = 'NetForensiq'
 YEAR = 2026
-REPOSITORY = 'https://github.com/Anbu-00001/NetForensiq'
+REPOSITORY = 'https://github.com/fuzail04116/NetForensiq'
 LICENSE = 'MIT'
 ORIGIN = ('Built for KANAD S.H.I.E.L.D. 2026, the Ahmedabad City Police cybercrime '
           'hackathon run by the Cyber Crime Branch with i-Hub Gujarat.')

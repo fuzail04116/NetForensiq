@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Anbuchelvan Ganesan — NetForensiq (https://github.com/Anbu-00001/NetForensiq)
+// Copyright (c) 2026 A Muhammed Fuzail — NetForensiq (https://github.com/fuzail04116/NetForensiq)
 // Run by evidence/tests_case_package_js.py. For every <name>.json in the
 // directory, verify it here and require the result to equal what the Python
 // verifier recorded in <name>.expected.json: same ok, same fingerprint, and the

@@ -2,10 +2,10 @@ cff-version: 1.2.0
 message: "If you use NetForensiq, or build on it, please cite it as below."
 title: "NetForensiq: network forensics and Android malware examination for police cybercrime investigation"
 authors:
-  - family-names: "Ganesan"
-    given-names: "Anbuchelvan"
-repository-code: "https://github.com/Anbu-00001/NetForensiq"
-url: "https://github.com/Anbu-00001/NetForensiq"
+  - family-names: "Fuzail"
+    given-names: "A Muhammed"
+repository-code: "https://github.com/fuzail04116/NetForensiq"
+url: "https://github.com/fuzail04116/NetForensiq"
 license: MIT
 version: "1.0.0"
 date-released: "2026-09-19"
