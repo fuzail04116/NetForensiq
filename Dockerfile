@@ -178,13 +178,6 @@ RUN apt-get update \
 # through APK_ENGINE_PYTHON.
 RUN cp "$(readlink -f "$(command -v python3)")" /usr/local/bin/python3-analysis
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libcap2-bin \
-    && setcap cap_net_raw=eip "$(readlink -f "$(command -v python3)")" \
-    && apt-get purge -y libcap2-bin \
-    && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/*
-
 USER netforensiq
 
 EXPOSE 8000

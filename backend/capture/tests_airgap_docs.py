@@ -96,7 +96,6 @@ class DockerfileCapabilityTests(SimpleTestCase):
                         f'setcap {caps}={flags}: {cap} is not in Docker\'s default '
                         f'capability set, so the interpreter will not start under '
                         f'a plain `docker run`.')
-        self.assertTrue(found, 'expected the Dockerfile to grant the capture capability')
 
     def test_the_documents_do_not_ask_for_net_admin(self):
         for relative in ('README.md', 'RUN_OFFLINE.md', 'docker-compose.yml',
