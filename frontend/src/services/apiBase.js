@@ -19,11 +19,7 @@ function resolve() {
   if (configured) return configured;
 
   if (import.meta.env.PROD) {
-    // Loud, because a production build should not be guessing.
-    console.warn(
-      'VITE_API_BASE was not set at build time; falling back to same-origin /api.',
-    );
-    return `${window.location.origin}/api`;
+    return 'https://netforensiq-backend.onrender.com/api';
   }
   return 'http://127.0.0.1:8000/api';
 }

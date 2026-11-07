@@ -43,8 +43,18 @@ DEBUG = os.getenv('DEBUG', 'False') == 'True'
 # exception, which meant the platform could not be deployed to any hostname
 # without editing source. Comma-separated.
 ALLOWED_HOSTS = [
-    host.strip() for host in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+    host.strip() for host in os.getenv(
+        'ALLOWED_HOSTS',
+        'localhost,127.0.0.1,netforensiq-backend.onrender.com,.onrender.com,*',
+    ).split(',')
     if host.strip()
+]
+
+CSRF_TRUSTED_ORIGINS = [
+    "https://net-forensiq.vercel.app",
+    "https://*.vercel.app",
+    "https://netforensiq-backend.onrender.com",
+    "https://*.onrender.com",
 ]
 
 
@@ -366,6 +376,10 @@ HOME_NET = [
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://net-forensiq.vercel.app",
+]
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://.*\.vercel\.app$",
 ]
 _extra_origins = os.getenv('CORS_EXTRA_ORIGINS', '')
 if _extra_origins:
