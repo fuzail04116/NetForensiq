@@ -12,10 +12,13 @@
 [![Tests](https://img.shields.io/badge/tests-845_passing-1B6E3C?style=flat-square)](#tests)
 [![Outbound](https://img.shields.io/badge/Outbound_connections-none_by_default-1B6E3C?style=flat-square)](#runs-without-a-network)
 [![BSA §63](https://img.shields.io/badge/BSA_2023-§63_certified-6B3FA0?style=flat-square)](#bsa-section-63-certificates)
+[![Vercel Deployment](https://img.shields.io/badge/Vercel-Live_Demo-000000?style=flat-square&logo=vercel&logoColor=white)](https://net-forensiq.vercel.app/)
 
 **2nd Place — KANAD S.H.I.E.L.D. 2026**
 Cyber Crime Branch, Ahmedabad City Police × i-Hub Gujarat
 *Category 2 · Problem Statement #8 — Network & Packet Forensics Platform*
+
+🌐 **Live Frontend Deployment:** [https://net-forensiq.vercel.app/](https://net-forensiq.vercel.app/)
 
 </div>
 
@@ -138,6 +141,13 @@ None of this is measured by this project except the last line; it is why a tool 
 ---
 
 ## Quick Start
+
+### 🌐 Live Frontend Demo (Vercel)
+
+The frontend interface is live and deployed on Vercel:
+👉 **[https://net-forensiq.vercel.app/](https://net-forensiq.vercel.app/)**
+
+### 🐳 Self-Hosted / Full Stack (Docker)
 
 ```bash
 git clone https://github.com/fuzail04116/NetForensiq.git

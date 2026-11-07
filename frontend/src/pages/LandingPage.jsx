@@ -396,44 +396,69 @@ function LandingPage() {
         sx={{
           borderTop: '1px solid #ECEEF1',
           px: { xs: 3, md: 5 }, py: 2.5,
-          display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap',
+          display: 'flex', flexDirection: 'column', gap: 2,
         }}
       >
-        <Typography
-          sx={{
-            fontSize: 10.5, letterSpacing: 0.8,
-            fontFamily: "'JetBrains Mono', monospace", color: '#5A6068',
-          }}
-        >
-          NETFORENSIQ v{engine?.version ?? '—'}
-        </Typography>
-        {/* Attribution comes from the engine, not from this file: the author is
-            written once, in backend/netforensiq_backend/provenance.py, and a
-            deployment shows whoever that says. */}
-        {engine?.provenance && (
+        <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', textAlign: 'center' }}>
           <Typography
             component="a"
-            href={engine.provenance.repository}
+            href="https://github.com/fuzail04116/NetForensiq"
             target="_blank"
             rel="noopener noreferrer"
             sx={{
-              fontSize: 10.5, letterSpacing: 0.8, textDecoration: 'none',
-              fontFamily: "'JetBrains Mono', monospace", color: '#5A6068',
-              '&:hover': { color: '#111315' },
+              fontSize: { xs: 11, sm: 12.5 },
+              letterSpacing: 0.8,
+              fontFamily: "'JetBrains Mono', monospace",
+              fontWeight: 700,
+              color: '#0284c7',
+              textDecoration: 'none',
+              '&:hover': { textDecoration: 'underline', color: '#0369a1' },
             }}
           >
-            © {engine.provenance.copyright.replace(/^Copyright \(c\) /, '')} · {engine.provenance.license}
+            YOU CAN CHECKOUT MY PRODUCT AT --&gt; : https://github.com/fuzail04116/NetForensiq
           </Typography>
-        )}
-        <Box sx={{ flexGrow: 1 }} />
-        <Typography
+        </Box>
+        <Box
           sx={{
-            fontSize: 10.5, letterSpacing: 0.8,
-            fontFamily: "'JetBrains Mono', monospace", color: '#5A6068',
+            display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap',
           }}
         >
-          Sign-in attempts are recorded
-        </Typography>
+          <Typography
+            sx={{
+              fontSize: 10.5, letterSpacing: 0.8,
+              fontFamily: "'JetBrains Mono', monospace", color: '#5A6068',
+            }}
+          >
+            NETFORENSIQ v{engine?.version ?? '—'}
+          </Typography>
+          {/* Attribution comes from the engine, not from this file: the author is
+              written once, in backend/netforensiq_backend/provenance.py, and a
+              deployment shows whoever that says. */}
+          {engine?.provenance && (
+            <Typography
+              component="a"
+              href={engine.provenance.repository}
+              target="_blank"
+              rel="noopener noreferrer"
+              sx={{
+                fontSize: 10.5, letterSpacing: 0.8, textDecoration: 'none',
+                fontFamily: "'JetBrains Mono', monospace", color: '#5A6068',
+                '&:hover': { color: '#111315' },
+              }}
+            >
+              © {engine.provenance.copyright.replace(/^Copyright \(c\) /, '')} · {engine.provenance.license}
+            </Typography>
+          )}
+          <Box sx={{ flexGrow: 1 }} />
+          <Typography
+            sx={{
+              fontSize: 10.5, letterSpacing: 0.8,
+              fontFamily: "'JetBrains Mono', monospace", color: '#5A6068',
+            }}
+          >
+            Sign-in attempts are recorded
+          </Typography>
+        </Box>
       </Box>
     </Box>
   );
