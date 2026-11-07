@@ -48,8 +48,8 @@ FROM node:22-slim AS frontend
 WORKDIR /build
 # Copied separately from the source so a change to a component does not
 # invalidate the dependency layer — npm ci is the slow step.
-COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm ci || npm install
 
 COPY frontend/ ./
 # Same-origin /api, because Django serves this bundle from the same port.
@@ -90,6 +90,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir --no-deps -r requirements-nodeps.txt
 
 COPY backend/ ./
+COPY docker-entrypoint.sh ./docker-entrypoint.sh
+RUN chmod +x ./docker-entrypoint.sh
 # The version file lives at the repository root, outside the build context
 # copied above. Without this the container reports 0.0.0-unknown on its own
 # landing page — see netforensiq_backend/version.py.
@@ -208,8 +210,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 # machine that happened to be measured is a timeout that fails on a slower one.
 # Imports beyond the upload cap are routed to `manage.py import_pcap`, which
 # has no timeout at all.
-CMD ["gunicorn", "netforensiq_backend.wsgi:application", \
-     "--bind", "0.0.0.0:8000", \
-     "--workers", "3", \
-     "--timeout", "1800", \
-     "--access-logfile", "-"]
+CMD ["/app/docker-entrypoint.sh"]

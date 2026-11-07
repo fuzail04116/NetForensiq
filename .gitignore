@@ -69,7 +69,7 @@ backend/updates/
 # Node / JavaScript
 # ──────────────────────────────────────────────────────────────
 node_modules/
-package-lock.json
+# package-lock.json tracked for Docker builds
 yarn.lock
 pnpm-lock.yaml
 
