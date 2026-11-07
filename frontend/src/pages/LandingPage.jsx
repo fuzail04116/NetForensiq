@@ -415,7 +415,7 @@ function LandingPage() {
               '&:hover': { textDecoration: 'underline', color: '#0369a1' },
             }}
           >
-            YOU CAN CHECKOUT MY PRODUCT AT --&gt; : https://github.com/fuzail04116/NetForensiq
+            YOU CAN CHECKOUT MY PRODUCT AT ---&gt; https://github.com/fuzail04116/NetForensiq
           </Typography>
         </Box>
         <Box
