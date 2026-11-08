@@ -5,10 +5,10 @@
 set -e
 
 echo "==> Running database migrations..."
-python manage.py migrate --noinput
+python3 manage.py migrate --noinput
 
 echo "==> Seeding demo accounts..."
-python manage.py seed_demo --synthetic-only --force || true
+python3 manage.py seed_demo --synthetic-only --force || true
 
 PORT_TO_BIND="${PORT:-8000}"
 echo "==> Starting Gunicorn on port ${PORT_TO_BIND}..."

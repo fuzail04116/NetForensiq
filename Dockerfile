@@ -118,7 +118,7 @@ ENV APK_ENGINE_PYTHON=/usr/local/bin/python3-analysis \
     SIGNING_KEY_FILE=/app/data/.signing.key \
     UPDATES_ROOT=/app/data/updates
 
-RUN python manage.py collectstatic --noinput
+RUN python3 manage.py collectstatic --noinput
 
 # Runs as a non-root user.
 #
@@ -188,7 +188,7 @@ EXPOSE 8000
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/engine/', timeout=4).status==200 else 1)"
+    CMD python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/engine/', timeout=4).status==200 else 1)"
 
 # --timeout is the ceiling on one synchronous request, and browser-uploaded
 # PCAP import is the longest one there is: the file is hashed, sealed, parsed
