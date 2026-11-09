@@ -18,7 +18,7 @@
 Cyber Crime Branch, Ahmedabad City Police × i-Hub Gujarat
 *Category 2 · Problem Statement #8 — Network & Packet Forensics Platform*
 
-🌐 **Live Frontend Deployment:** [https://net-forensiq.vercel.app/](https://net-forensiq.vercel.app/)
+🌐 **Live Deployment url:** [https://net-forensiq.vercel.app/](https://net-forensiq.vercel.app/)
 
 </div>
 
