@@ -36,6 +36,8 @@ api.interceptors.request.use((config) => {
 });
 
 // Auto-refresh expired access tokens
+let refreshPromise = null;
+
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
@@ -51,17 +53,31 @@ api.interceptors.response.use(
       const refresh = sessionStorage.getItem('refresh_token');
 
       if (refresh) {
+        if (!refreshPromise) {
+          refreshPromise = axios.post(`${API_BASE}/auth/login/refresh/`, { refresh })
+            .then((res) => {
+              sessionStorage.setItem('access_token', res.data.access);
+              if (res.data.refresh) {
+                sessionStorage.setItem('refresh_token', res.data.refresh);
+              }
+              return res.data.access;
+            })
+            .catch((refreshErr) => {
+              sessionStorage.clear();
+              window.location.href = '/login';
+              throw refreshErr;
+            })
+            .finally(() => {
+              refreshPromise = null;
+            });
+        }
+
         try {
-          const res = await axios.post(`${API_BASE}/auth/login/refresh/`, { refresh });
-          sessionStorage.setItem('access_token', res.data.access);
-          if (res.data.refresh) {
-            sessionStorage.setItem('refresh_token', res.data.refresh);
-          }
-          original.headers.Authorization = `Bearer ${res.data.access}`;
+          const newAccess = await refreshPromise;
+          original.headers.Authorization = `Bearer ${newAccess}`;
           return api(original);
         } catch {
-          sessionStorage.clear();
-          window.location.href = '/login';
+          return Promise.reject(error);
         }
       } else {
         sessionStorage.clear();

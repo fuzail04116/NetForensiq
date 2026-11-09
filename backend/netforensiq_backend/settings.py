@@ -34,7 +34,35 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # SECURITY WARNING: keep the secret key used in production secret!
 # A generated ephemeral key keeps a fresh clone runnable; any real deployment
 # must set SECRET_KEY in .env, otherwise sessions and tokens reset on restart.
-SECRET_KEY = os.getenv('SECRET_KEY') or secrets.token_urlsafe(50)
+def _get_or_create_secret_key():
+    env_key = os.getenv('SECRET_KEY')
+    if env_key:
+        return env_key
+
+    # Try persistent secret key file so all gunicorn workers share the exact same key
+    candidates = [
+        Path(os.getenv('DATA_DIR', '/app/data')) / '.secret_key',
+        BASE_DIR / '.secret_key',
+        Path(tempfile.gettempdir()) / 'netforensiq_secret_key.txt',
+    ]
+    for key_file in candidates:
+        try:
+            if key_file.exists():
+                key = key_file.read_text(encoding='utf-8').strip()
+                if key:
+                    return key
+            key_file.parent.mkdir(parents=True, exist_ok=True)
+            new_key = secrets.token_urlsafe(50)
+            key_file.write_text(new_key, encoding='utf-8')
+            return new_key
+        except Exception:
+            continue
+
+    # Stable deterministic fallback if file IO fails
+    return 'netforensiq-secret-key-stable-fallback-2026-auth-token-shared'
+
+
+SECRET_KEY = _get_or_create_secret_key()
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DEBUG', 'False') == 'True'
